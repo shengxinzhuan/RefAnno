@@ -746,6 +746,45 @@ def choose_representatives(loci, sj, iso, proteins, args, trusted):
     return winners, dropped
 
 
+def detect_duplicate_clusters(winners, args):
+    by_location = defaultdict(list)
+    for winner in winners:
+        model = winner["model"]
+        by_location[(model.chrom, model.strand)].append(model)
+    candidates = []
+    for models in by_location.values():
+        models.sort(key=lambda m: (m.cds[0][0], m.cds[-1][1], m.key))
+        current = []
+        for model in models:
+            if current:
+                previous = current[-1]
+                gap = max(0, model.cds[0][0] - previous.cds[-1][1] - 1)
+                length_ratio = max(model.cds_len, previous.cds_len) / max(1, min(model.cds_len, previous.cds_len))
+                similar = (gap <= args.tandem_max_gap and length_ratio <= args.tandem_cds_ratio and
+                           abs(len(model.cds) - len(previous.cds)) <= 1)
+                if similar:
+                    current.append(model)
+                else:
+                    if len(current) >= 2:
+                        candidates.append(current)
+                    current = [model]
+            else:
+                current = [model]
+        if len(current) >= 2:
+            candidates.append(current)
+    candidates.sort(key=lambda group: (natural_key(group[0].chrom), group[0].cds[0][0],
+                                       group[0].strand, group[0].key))
+    annotations = {}
+    counters = Counter()
+    for group in candidates:
+        kind = "tandem" if len(group) >= args.tandem_min_members else "duplicate"
+        counters[kind] += 1
+        cluster_id = f"{kind.upper()}{counters[kind]:06d}"
+        for model in group:
+            annotations[model.key] = {"type": kind, "cluster": cluster_id, "size": len(group)}
+    return annotations
+
+
 def consensus_exons(reads, node_window=3, end_window=50):
     clusters = []
     for read in sorted(reads, key=lambda r: (len(r.exons), r.exons, r.read_id)):
@@ -907,6 +946,7 @@ def natural_key(value):
 def write_outputs(winners, dropped, models, genome, args):
     winners.sort(key=lambda w: (natural_key(w["model"].chrom), w["model"].cds[0][0],
                                 w["model"].cds[-1][1], w["model"].strand, w["model"].key))
+    duplicate_info = detect_duplicate_clusters(winners, args)
     retained = set()
     transcript_count = 0
     iso_loci = 0
@@ -917,7 +957,8 @@ def write_outputs(winners, dropped, models, genome, args):
         gff.write("##gff-version 3\n")
         fields = ["gene_id", "transcript_id", "role", "chrom", "start", "end", "strand", "source_model",
                   "score", "cds_depth", "cds_coverage", "isoform_molecules", "protein_target",
-                  "protein_identity", "protein_coverage", "protein_query_coverage", "support", "reason", "review"]
+                  "protein_identity", "protein_coverage", "protein_query_coverage", "duplicate_type",
+                  "duplicate_cluster", "duplicate_size", "support", "reason", "review"]
         writer = csv.DictWriter(report, fieldnames=fields, delimiter="\t", extrasaction="ignore")
         writer.writeheader()
         for index, winner in enumerate(winners, 1):
@@ -936,6 +977,11 @@ def write_outputs(winners, dropped, models, genome, args):
                           ("protein_coverage", f"{model.protein_coverage:.3f}"),
                           ("protein_identity", f"{model.protein_identity:.3f}"),
                           ("isoform_count", len(alternatives) + 1)]
+            duplicate = duplicate_info.get(model.key)
+            if duplicate:
+                gene_attrs.extend([("duplicate_type", duplicate["type"]),
+                                   ("duplicate_cluster", duplicate["cluster"]),
+                                   ("duplicate_size", duplicate["size"])])
             if model.review:
                 gene_attrs.append(("flag_review", ",".join(sorted(set(model.review)))))
             gff.write(model_row(model, "gene", model.exons[0][0], model.exons[-1][1], gene_attrs) + "\n")
@@ -949,6 +995,9 @@ def write_outputs(winners, dropped, models, genome, args):
                              "protein_identity": f"{model.protein_identity:.3f}",
                              "protein_coverage": f"{model.protein_coverage:.3f}",
                              "protein_query_coverage": f"{model.protein_query_coverage:.3f}",
+                             "duplicate_type": duplicate["type"] if duplicate else "",
+                             "duplicate_cluster": duplicate["cluster"] if duplicate else "",
+                             "duplicate_size": duplicate["size"] if duplicate else "",
                              "support": "+".join(sorted(winner["sources"])),
                              "reason": winner["reason"], "review": ",".join(sorted(set(model.review)))})
             for rank, (alternative, support) in enumerate(alternatives, 2):
@@ -965,6 +1014,9 @@ def write_outputs(winners, dropped, models, genome, args):
                                  "protein_identity": f"{alternative.protein_identity:.3f}",
                                  "protein_coverage": f"{alternative.protein_coverage:.3f}",
                                  "protein_query_coverage": f"{alternative.protein_query_coverage:.3f}",
+                                 "duplicate_type": duplicate["type"] if duplicate else "",
+                                 "duplicate_cluster": duplicate["cluster"] if duplicate else "",
+                                 "duplicate_size": duplicate["size"] if duplicate else "",
                                  "support": alternative.set_name,
                                  "reason": "isoseq_exact_chain", "review": ""})
 
@@ -995,6 +1047,10 @@ def write_outputs(winners, dropped, models, genome, args):
         "utr_consensus_changed": sum(bool(w.get("utr_changed")) for w in winners),
         "protein_supported_transcripts": sum(m.protein_coverage > 0 for m in models),
         "protein_only_retained_genes": sum(w["reason"] == "unique_with_protein" for w in winners),
+        "tandem_clusters": len({d["cluster"] for d in duplicate_info.values() if d["type"] == "tandem"}),
+        "tandem_genes": sum(d["type"] == "tandem" for d in duplicate_info.values()),
+        "duplicate_clusters": len({d["cluster"] for d in duplicate_info.values() if d["type"] == "duplicate"}),
+        "duplicate_genes": sum(d["type"] == "duplicate" for d in duplicate_info.values()),
         "max_isoforms": args.max_isoforms,
     }
     with open(os.path.join(args.outdir, "summary.json"), "w") as out:
@@ -1037,6 +1093,9 @@ def parse_args(argv=None):
     parser.add_argument("--min-cds-coverage", type=float, default=0.9)
     parser.add_argument("--min-sj", type=int, default=3)
     parser.add_argument("--conflict-overlap", type=float, default=0.3)
+    parser.add_argument("--tandem-max-gap", type=int, default=20000, help="串联重复相邻基因最大间距")
+    parser.add_argument("--tandem-cds-ratio", type=float, default=1.8, help="串联重复相邻基因最大 CDS 长度比")
+    parser.add_argument("--tandem-min-members", type=int, default=3, help="tandem 簇最少成员数；默认 2 成员标 duplicate")
     parser.add_argument("--trusted-set", action="append", default=[], help="允许无 RNA 证据单独保留的集合名")
     parser.add_argument("--set-weight", action="append", default=[], metavar="NAME=FLOAT")
     parser.add_argument("--utr-consensus", action="store_true", help="用 Iso-seq 局部主导链替换 UTR 外显子，CDS 不变")
@@ -1051,6 +1110,8 @@ def parse_args(argv=None):
         parser.error("覆盖度、主导度、一致性和冲突重叠阈值必须在 0–1 之间")
     if args.min_isoform_molecules < 1 or args.utr_min_molecules < 1 or args.min_sj < 1 or args.threads < 1:
         parser.error("分子数、junction 支持阈值和线程数必须至少为 1")
+    if args.tandem_max_gap < 0 or args.tandem_cds_ratio < 1 or args.tandem_min_members < 2:
+        parser.error("串联间距不能为负，CDS 长度比至少为 1，簇成员数至少为 2")
     return args
 
 

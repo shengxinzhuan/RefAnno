@@ -156,6 +156,44 @@ if best.strand == other.strand and \
 
 双向比例是必要的：一个短 CDS 可能几乎完全落入长 CDS，但只占长 CDS 的一小部分。任一方向超过阈值即冲突，可避免同一基因的长短版本同时进入最终注释。阈值可用 `--conflict-overlap` 调整，默认 `0.3`。
 
+### 串联重复与二联体
+
+串联重复是基因组中的真实组织结构，不能与同一座位的冗余注释混为一谈。GFFmerge 在完成主代表选择后，对最终基因按同染色体、同链和相邻位置进行聚类，**只标记，不删除串联成员**。
+
+相邻基因默认需同时满足：
+
+- 基因组间距不超过 20 kb；
+- CDS 长度比不超过 1.8；
+- CDS 区块数差不超过 1。
+
+相似关系可以沿相邻基因传递，形成一个重复簇。默认至少 3 个成员标为 `tandem`，恰好 2 个成员标为 `duplicate`。核心判据为：
+
+```python
+gap = max(0, model.cds[0][0] - previous.cds[-1][1] - 1)
+length_ratio = max(model.cds_len, previous.cds_len) / min(model.cds_len, previous.cds_len)
+similar = (
+    gap <= args.tandem_max_gap
+    and length_ratio <= args.tandem_cds_ratio
+    and abs(len(model.cds) - len(previous.cds)) <= 1
+)
+```
+
+最终 GFF 的基因行会增加：
+
+```text
+duplicate_type=tandem
+duplicate_cluster=TANDEM000001
+duplicate_size=3
+```
+
+`decision_report.tsv` 同样记录这三个字段，`summary.json` 提供 `tandem_clusters`、`tandem_genes`、`duplicate_clusters` 和 `duplicate_genes` 统计。可用以下参数调整：
+
+```text
+--tandem-max-gap 20000
+--tandem-cds-ratio 1.8
+--tandem-min-members 3
+```
+
 ### 单套注释
 
 非可信集合中的单套模型满足以下任一条件即可保留：
