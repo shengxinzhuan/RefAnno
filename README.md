@@ -206,7 +206,11 @@ duplicate_size=3
 - 单套注释中的候选串联/二联成员可凭上述家族证据保留，原因是 `tandem_family_support`，并同时进入复核标签，避免与精确 unique 支持混淆。
 - 家族证据不额外增加代表评分，不改变同座位高分模型优先的规则，也不救援含内部终止子的模型。
 
-输出中的 `family_support` 记录具体来源，如 `protein`、`multi_depth`、`multi_junction` 或其组合；`cds_multi_depth` 和 `cds_multi_coverage` 则记录模型自身的多重比对覆盖。`summary.json` 的 `tandem_family_retained_genes` 统计由这一通道保留的基因数。
+**二联体 `duplicate` 与多成员串联簇 `tandem` 享有完全相同的家族救援规则。** 二联体不是只做标记：一个成员有合格蛋白或家族级多重比对证据时，另一个成员也可保留。两类关系统一使用 `tandem_family_support` 作为保留原因，不另设 `duplicate_family_support`。
+
+例如一对重复基因中，第一个拷贝自身有蛋白命中时记为 `unique_with_protein`；第二个拷贝没有自身命中、但符合二联体结构条件时，可记为 `tandem_family_support` 和 `family_support=protein`，二者均保留且 `duplicate_type=duplicate`。
+
+输出中的 `family_support` 记录具体来源，如 `protein`、`multi_depth`、`multi_junction` 或其组合；`cds_multi_depth` 和 `cds_multi_coverage` 则记录模型自身的多重比对覆盖。`summary.json` 的 `tandem_family_retained_genes` 统计由这一通道保留的基因数，**同时包含二联体和多成员串联簇**。
 
 ### 单套注释
 
