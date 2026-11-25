@@ -82,6 +82,9 @@ class Model:
     score: float = 0.0
     depth: float = 0.0
     coverage: float = 0.0
+    multi_depth: float = 0.0
+    multi_coverage: float = 0.0
+    family_support: str = ""
     iso_support: int = 0
     protein_coverage: float = 0.0
     protein_identity: float = 0.0
@@ -557,12 +560,12 @@ class DepthIndex:
         if key in self.cache:
             return self.cache[key]
         if not self.bams:
-            return 0.0, 0.0
-        covered = 0
-        total_depth = 0
+            return 0.0, 0.0, 0.0, 0.0
+        covered = [0, 0]
+        total_depth = [0, 0]
         for start, end in model.cds:
             size = end - start + 1
-            diff = [0] * (size + 1)
+            diffs = [[0] * (size + 1), [0] * (size + 1)]
             for bam in self.bams:
                 try:
                     reads = bam.fetch(model.chrom, start - 1, end)
@@ -571,20 +574,22 @@ class DepthIndex:
                 for read in reads:
                     if read.is_unmapped or read.is_secondary or read.is_supplementary:
                         continue
-                    if read.has_tag("NH") and read.get_tag("NH") > 1:
-                        continue
+                    multi = read.has_tag("NH") and read.get_tag("NH") > 1
+                    diff = diffs[int(multi)]
                     for block_start, block_end in read.get_blocks():
                         left = max(start - 1, block_start)
                         right = min(end, block_end)
                         if left < right:
                             diff[left - start + 1] += 1
                             diff[right - start + 1] -= 1
-            current = 0
-            for value in diff[:size]:
-                current += value
-                total_depth += current
-                covered += current > 0
-        result = covered / max(model.cds_len, 1), total_depth / max(model.cds_len, 1)
+            for index, diff in enumerate(diffs):
+                current = 0
+                for value in diff[:size]:
+                    current += value
+                    total_depth[index] += current
+                    covered[index] += current > 0
+        result = (covered[0] / max(model.cds_len, 1), total_depth[0] / max(model.cds_len, 1),
+                  covered[1] / max(model.cds_len, 1), total_depth[1] / max(model.cds_len, 1))
         self.cache[key] = result
         return result
 
@@ -637,7 +642,7 @@ def cluster_loci(models):
 def score_models(models, sj, iso, proteins, depth, genome, weights, min_sj, min_iso, min_coverage, min_protein_identity):
     protein_cache = {}
     for model in models:
-        model.coverage, model.depth = depth.get(model)
+        model.coverage, model.depth, model.multi_coverage, model.multi_depth = depth.get(model)
         model.iso_support = iso.exact_support(model, min_coverage)
         score = weights.get(model.set_name.lower(), 1.0)
         for intron in model.cds_introns:
@@ -698,21 +703,30 @@ def model_has_protein(model, proteins, args):
             model.protein_query_coverage >= args.min_protein_query_coverage)
 
 
-def choose_representatives(loci, sj, iso, proteins, args, trusted):
+def chain_groups(locus):
+    groups = []
+    for model in sorted(locus, key=lambda m: m.key):
+        for group in groups:
+            if same_chain(model, group[0]):
+                group.append(model)
+                break
+        else:
+            groups.append([model])
+    return groups
+
+
+def best_in_group(group):
+    return sorted(group, key=lambda m: (-m.score, -m.cds_len, m.key))[0]
+
+
+def choose_representatives(loci, sj, iso, proteins, args, trusted, tandem_info):
     winners = []
     dropped = {}
     for locus in loci:
-        chain_groups = []
-        for model in sorted(locus, key=lambda m: m.key):
-            for group in chain_groups:
-                if same_chain(model, group[0]):
-                    group.append(model)
-                    break
-            else:
-                chain_groups.append([model])
         kept = []
-        for group in chain_groups:
-            best = sorted(group, key=lambda m: (-m.score, -m.cds_len, m.key))[0]
+        for group in chain_groups(locus):
+            best = best_in_group(group)
+            family = tandem_info.get(best.key, {})
             sources = {m.set_name for m in group}
             if len(sources) >= 2:
                 reason = f"{len(sources)}set_chain_consensus"
@@ -722,6 +736,11 @@ def choose_representatives(loci, sj, iso, proteins, args, trusted):
                 reason = "unique_with_evidence"
             elif model_has_protein(best, proteins, args):
                 reason = "unique_with_protein"
+            elif family.get("family_support") and "internal_stop" not in best.review:
+                reason = "tandem_family_support"
+                best.family_support = family["family_support"]
+                if "tandem_family_support" not in best.review:
+                    best.review.append("tandem_family_support")
             else:
                 for model in group:
                     dropped[model.key] = "unique_no_evidence"
@@ -746,10 +765,9 @@ def choose_representatives(loci, sj, iso, proteins, args, trusted):
     return winners, dropped
 
 
-def detect_duplicate_clusters(winners, args):
+def detect_duplicate_clusters(models, args):
     by_location = defaultdict(list)
-    for winner in winners:
-        model = winner["model"]
+    for model in models:
         by_location[(model.chrom, model.strand)].append(model)
     candidates = []
     for models in by_location.values():
@@ -761,7 +779,8 @@ def detect_duplicate_clusters(winners, args):
                 gap = max(0, model.cds[0][0] - previous.cds[-1][1] - 1)
                 length_ratio = max(model.cds_len, previous.cds_len) / max(1, min(model.cds_len, previous.cds_len))
                 similar = (gap <= args.tandem_max_gap and length_ratio <= args.tandem_cds_ratio and
-                           abs(len(model.cds) - len(previous.cds)) <= 1)
+                           abs(len(model.cds) - len(previous.cds)) <= 1 and
+                           max(reciprocal_cds_overlap(model, previous)) <= args.conflict_overlap)
                 if similar:
                     current.append(model)
                 else:
@@ -783,6 +802,43 @@ def detect_duplicate_clusters(winners, args):
         for model in group:
             annotations[model.key] = {"type": kind, "cluster": cluster_id, "size": len(group)}
     return annotations
+
+
+def prepare_tandem_evidence(loci, sj, proteins, args):
+    grouped_loci = [chain_groups(locus) for locus in loci]
+    representatives = [best_in_group(group) for groups in grouped_loci for group in groups]
+    annotations = detect_duplicate_clusters(representatives, args)
+    cluster_members = defaultdict(list)
+    for model in representatives:
+        if model.key in annotations:
+            cluster_members[annotations[model.key]["cluster"]].append(model)
+    cluster_support = {}
+    for cluster, members in cluster_members.items():
+        support = []
+        if any(model_has_protein(model, proteins, args) for model in members):
+            support.append("protein")
+        if any(model.multi_coverage >= 0.5 and model.multi_depth >= args.tandem_min_multi_depth
+               for model in members):
+            support.append("multi_depth")
+        multi_junction = 0
+        for model in members:
+            for intron in model.cds_introns:
+                _, multi = sj.get(model, intron)
+                multi_junction = max(multi_junction, multi)
+        if multi_junction >= 3 * args.min_sj:
+            support.append("multi_junction")
+        cluster_support[cluster] = "+".join(support)
+    tandem_info = {}
+    for groups in grouped_loci:
+        for group in groups:
+            annotation = annotations.get(best_in_group(group).key)
+            if not annotation:
+                continue
+            annotation = dict(annotation)
+            annotation["family_support"] = cluster_support[annotation["cluster"]]
+            for model in group:
+                tandem_info[model.key] = annotation
+    return tandem_info
 
 
 def consensus_exons(reads, node_window=3, end_window=50):
@@ -946,7 +1002,7 @@ def natural_key(value):
 def write_outputs(winners, dropped, models, genome, args):
     winners.sort(key=lambda w: (natural_key(w["model"].chrom), w["model"].cds[0][0],
                                 w["model"].cds[-1][1], w["model"].strand, w["model"].key))
-    duplicate_info = detect_duplicate_clusters(winners, args)
+    duplicate_info = detect_duplicate_clusters([w["model"] for w in winners], args)
     retained = set()
     transcript_count = 0
     iso_loci = 0
@@ -956,7 +1012,8 @@ def write_outputs(winners, dropped, models, genome, args):
             open(os.path.join(args.outdir, "decision_report.tsv"), "w", newline="") as report:
         gff.write("##gff-version 3\n")
         fields = ["gene_id", "transcript_id", "role", "chrom", "start", "end", "strand", "source_model",
-                  "score", "cds_depth", "cds_coverage", "isoform_molecules", "protein_target",
+                  "score", "cds_depth", "cds_coverage", "cds_multi_depth", "cds_multi_coverage",
+                  "family_support", "isoform_molecules", "protein_target",
                   "protein_identity", "protein_coverage", "protein_query_coverage", "duplicate_type",
                   "duplicate_cluster", "duplicate_size", "support", "reason", "review"]
         writer = csv.DictWriter(report, fieldnames=fields, delimiter="\t", extrasaction="ignore")
@@ -974,6 +1031,9 @@ def write_outputs(winners, dropped, models, genome, args):
                           ("source_model", model.source_model), ("reason", winner["reason"]),
                           ("score", f"{model.score:.2f}"), ("cds_depth", f"{model.depth:.2f}"),
                           ("cds_coverage", f"{model.coverage:.3f}"),
+                          ("cds_multi_depth", f"{model.multi_depth:.2f}"),
+                          ("cds_multi_coverage", f"{model.multi_coverage:.3f}"),
+                          ("family_support", model.family_support),
                           ("protein_coverage", f"{model.protein_coverage:.3f}"),
                           ("protein_identity", f"{model.protein_identity:.3f}"),
                           ("isoform_count", len(alternatives) + 1)]
@@ -991,6 +1051,9 @@ def write_outputs(winners, dropped, models, genome, args):
                              "chrom": model.chrom, "start": model.exons[0][0], "end": model.exons[-1][1],
                              "strand": model.strand, "source_model": model.source_model, "score": f"{model.score:.3f}",
                              "cds_depth": f"{model.depth:.3f}", "cds_coverage": f"{model.coverage:.3f}",
+                             "cds_multi_depth": f"{model.multi_depth:.3f}",
+                             "cds_multi_coverage": f"{model.multi_coverage:.3f}",
+                             "family_support": model.family_support,
                              "isoform_molecules": model.iso_support, "protein_target": model.protein_target,
                              "protein_identity": f"{model.protein_identity:.3f}",
                              "protein_coverage": f"{model.protein_coverage:.3f}",
@@ -1010,6 +1073,9 @@ def write_outputs(winners, dropped, models, genome, args):
                                  "end": alternative.exons[-1][1], "strand": alternative.strand,
                                  "source_model": alternative.source_model, "score": f"{alternative.score:.3f}",
                                  "cds_depth": f"{alternative.depth:.3f}", "cds_coverage": f"{alternative.coverage:.3f}",
+                                 "cds_multi_depth": f"{alternative.multi_depth:.3f}",
+                                 "cds_multi_coverage": f"{alternative.multi_coverage:.3f}",
+                                 "family_support": alternative.family_support,
                                  "isoform_molecules": support, "protein_target": alternative.protein_target,
                                  "protein_identity": f"{alternative.protein_identity:.3f}",
                                  "protein_coverage": f"{alternative.protein_coverage:.3f}",
@@ -1051,6 +1117,7 @@ def write_outputs(winners, dropped, models, genome, args):
         "tandem_genes": sum(d["type"] == "tandem" for d in duplicate_info.values()),
         "duplicate_clusters": len({d["cluster"] for d in duplicate_info.values() if d["type"] == "duplicate"}),
         "duplicate_genes": sum(d["type"] == "duplicate" for d in duplicate_info.values()),
+        "tandem_family_retained_genes": sum(w["reason"] == "tandem_family_support" for w in winners),
         "max_isoforms": args.max_isoforms,
     }
     with open(os.path.join(args.outdir, "summary.json"), "w") as out:
@@ -1096,6 +1163,7 @@ def parse_args(argv=None):
     parser.add_argument("--tandem-max-gap", type=int, default=20000, help="串联重复相邻基因最大间距")
     parser.add_argument("--tandem-cds-ratio", type=float, default=1.8, help="串联重复相邻基因最大 CDS 长度比")
     parser.add_argument("--tandem-min-members", type=int, default=3, help="tandem 簇最少成员数；默认 2 成员标 duplicate")
+    parser.add_argument("--tandem-min-multi-depth", type=float, default=5.0, help="串联家族多重比对 CDS 深度下限")
     parser.add_argument("--trusted-set", action="append", default=[], help="允许无 RNA 证据单独保留的集合名")
     parser.add_argument("--set-weight", action="append", default=[], metavar="NAME=FLOAT")
     parser.add_argument("--utr-consensus", action="store_true", help="用 Iso-seq 局部主导链替换 UTR 外显子，CDS 不变")
@@ -1110,8 +1178,8 @@ def parse_args(argv=None):
         parser.error("覆盖度、主导度、一致性和冲突重叠阈值必须在 0–1 之间")
     if args.min_isoform_molecules < 1 or args.utr_min_molecules < 1 or args.min_sj < 1 or args.threads < 1:
         parser.error("分子数、junction 支持阈值和线程数必须至少为 1")
-    if args.tandem_max_gap < 0 or args.tandem_cds_ratio < 1 or args.tandem_min_members < 2:
-        parser.error("串联间距不能为负，CDS 长度比至少为 1，簇成员数至少为 2")
+    if args.tandem_max_gap < 0 or args.tandem_cds_ratio < 1 or args.tandem_min_members < 2 or args.tandem_min_multi_depth < 0:
+        parser.error("串联间距和多重深度不能为负，CDS 长度比至少为 1，簇成员数至少为 2")
     return args
 
 
@@ -1154,7 +1222,8 @@ def main(argv=None):
         depth.close()
     loci = cluster_loci(models)
     trusted = {"egapx", "eviann", "e"} | {x.lower() for x in args.trusted_set}
-    winners, dropped = choose_representatives(loci, sj, iso, protein_evidence, args, trusted)
+    tandem_info = prepare_tandem_evidence(loci, sj, protein_evidence, args)
+    winners, dropped = choose_representatives(loci, sj, iso, protein_evidence, args, trusted, tandem_info)
     print(f"selected {len(winners)} primary genes from {len(loci)} loci", flush=True)
     if args.utr_consensus:
         apply_utr_consensus(winners, iso, args)

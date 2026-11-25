@@ -192,7 +192,21 @@ duplicate_size=3
 --tandem-max-gap 20000
 --tandem-cds-ratio 1.8
 --tandem-min-members 3
+--tandem-min-multi-depth 5
 ```
+
+#### 串联家族参与的保留裁决
+
+串联信息不仅用于输出标签，也会在主代表选择前参与候选模型的保留判断。处理原则是：**结构相似的独立拷贝可以共享家族级证据，但不能共享精确到某个拷贝的证据。**
+
+- unique read 深度、unique junction 和 Iso-seq 完整链仍只归属于实际匹配的模型，不在家族成员之间传递。
+- 任一成员有合格蛋白支持时，可形成家族级蛋白证据。这对每个蛋白只保留一个最优命中的情况尤其有用，其他拷贝不会被误判为完全无同源支持。
+- 多重比对 CDS 覆盖 ≥0.5 且平均深度 ≥5 时，形成 `multi_depth` 家族证据。默认阈值可用 `--tandem-min-multi-depth` 调整。
+- 多重比对 junction 支持达到普通 junction 阈值的 3 倍时，形成 `multi_junction` 家族证据。
+- 单套注释中的候选串联/二联成员可凭上述家族证据保留，原因是 `tandem_family_support`，并同时进入复核标签，避免与精确 unique 支持混淆。
+- 家族证据不额外增加代表评分，不改变同座位高分模型优先的规则，也不救援含内部终止子的模型。
+
+输出中的 `family_support` 记录具体来源，如 `protein`、`multi_depth`、`multi_junction` 或其组合；`cds_multi_depth` 和 `cds_multi_coverage` 则记录模型自身的多重比对覆盖。`summary.json` 的 `tandem_family_retained_genes` 统计由这一通道保留的基因数。
 
 ### 单套注释
 
