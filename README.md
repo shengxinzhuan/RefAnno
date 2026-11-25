@@ -132,6 +132,30 @@ samtools index -c isoseq.bam
 
 同一 CDS 剪接链得到至少两个输入集合支持时，该链可以保留。每个链组先选最高评分模型，再解决同座位、同链的 CDS 冲突。
 
+### 重复基因与同座位冲突
+
+GFFmerge 使用以下规则识别重复基因和同座位冲突：
+
+1. 多外显子模型要求完整 CDS 内含子链一致，才归为同一结构组。
+2. 单外显子模型没有内含子可比，CDS 重叠达到较短模型的 90% 时归为同组。
+3. 不同结构组若位于同一座位、同一转录链，且 CDS 双向重叠任一比例超过 30%，判为重复/冲突模型；保留证据评分最高者，其余写入 `dropped.gff3`，原因为 `locus_conflict_lower_score`。
+4. 反义重叠基因不会因这一条规则互相删除，低重叠的相邻基因也可分别保留。
+
+对应的核心 Python 片段如下，`blocks_coverage` 计算两组 CDS 区块的碱基重叠数：
+
+```python
+def reciprocal_cds_overlap(a, b):
+    value = blocks_coverage(a.cds, b.cds)
+    return value / max(a.cds_len, 1), value / max(b.cds_len, 1)
+
+# 同链且任一方向 CDS 重叠超过阈值时，低分模型进入 dropped
+if best.strand == other.strand and \
+        max(reciprocal_cds_overlap(best, other)) > args.conflict_overlap:
+    dropped[best.key] = "locus_conflict_lower_score"
+```
+
+双向比例是必要的：一个短 CDS 可能几乎完全落入长 CDS，但只占长 CDS 的一小部分。任一方向超过阈值即冲突，可避免同一基因的长短版本同时进入最终注释。阈值可用 `--conflict-overlap` 调整，默认 `0.3`。
+
 ### 单套注释
 
 非可信集合中的单套模型满足以下任一条件即可保留：
