@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""GFFmerge：多套 GFF 选优、蛋白/RNA 证据裁决与 Iso-seq 可变剪切输出。"""
+"""RefAnno: multi-evidence gene structure refinement and representative annotation."""
 
 import argparse
 import bisect
 import csv
 import json
-import math
 import os
 import re
 import subprocess
@@ -79,7 +78,14 @@ class Model:
     exons: list = field(default_factory=list)
     cds: list = field(default_factory=list)
     biotype: str = "protein_coding"
-    score: float = 0.0
+    source_weight: float = 1.0
+    structure_coverage: float = 0.0
+    structure_status: str = "untested"
+    junctions_supported: int = 0
+    canonical_junctions: int = 0
+    complete_cds: bool = False
+    rna_supported: bool = False
+    protein_supported: bool = False
     depth: float = 0.0
     coverage: float = 0.0
     multi_depth: float = 0.0
@@ -109,6 +115,10 @@ class Model:
     @property
     def cds_len(self):
         return sum(e - s + 1 for s, e in self.cds)
+
+    @property
+    def junctions_total(self):
+        return len(self.cds_introns)
 
     def finish(self):
         self.exons = sorted(set(self.exons or self.cds))
@@ -639,47 +649,56 @@ def cluster_loci(models):
     return list(groups.values())
 
 
-def score_models(models, sj, iso, proteins, depth, genome, weights, min_sj, min_iso, min_coverage, min_protein_identity):
+def evaluate_models(models, sj, iso, proteins, depth, genome, weights, min_sj, min_iso, min_coverage, min_protein_identity):
     protein_cache = {}
+    has_rna = bool(depth.bams or len(iso))
     for model in models:
+        model.source_weight = weights.get(model.set_name.lower(), 1.0)
         model.coverage, model.depth, model.multi_coverage, model.multi_depth = depth.get(model)
         model.iso_support = iso.exact_support(model, min_coverage)
-        score = weights.get(model.set_name.lower(), 1.0)
         for intron in model.cds_introns:
-            unique, multi = sj.get(model, intron)
+            unique, _ = sj.get(model, intron)
             iso_n = iso.junction_support(model, intron)
-            if iso_n >= min_iso:
-                score += 2.5
-            elif unique >= 3 * min_sj:
-                score += 2.0
-            elif unique >= min_sj:
-                score += 1.0
-            elif multi < 3 * min_sj:
-                score -= 1.5
-        score += min(len(model.cds), 5) * 0.3
-        if model.exons and (model.exons[0][0] < model.cds[0][0] or model.exons[-1][1] > model.cds[-1][1]):
-            score += 1.5
+            if unique >= min_sj or iso_n >= min_iso:
+                model.junctions_supported += 1
+            if genome.splice_strand(model.chrom, [intron]) == model.strand:
+                model.canonical_junctions += 1
+        if model.cds_introns:
+            model.structure_coverage = model.junctions_supported / model.junctions_total
+        else:
+            model.structure_coverage = 1.0 if model.iso_support >= min_iso else model.coverage
+        model.rna_supported = bool(
+            model.iso_support >= min_iso
+            or (model.cds_introns and model.junctions_supported)
+            or (not model.cds_introns and model.coverage >= 0.5 and model.depth >= 10)
+        )
+
         protein_key = (model.chrom, model.strand, tuple(model.cds))
         if protein_key not in protein_cache:
             seq = genome.cds_sequence(model)
             protein = translate(seq)
             complete = len(seq) % 3 == 0 and seq.startswith("ATG") and protein.endswith("*") and "*" not in protein[:-1]
             protein_cache[protein_key] = (complete, "*" in protein[:-1])
-        complete, internal_stop = protein_cache[protein_key]
-        if complete:
-            score += 1.0
+        model.complete_cds, internal_stop = protein_cache[protein_key]
         if internal_stop:
             model.review.append("internal_stop")
-        if model.depth > 0:
-            score += 0.5 * math.log1p(model.depth)
-        if model.iso_support > 0:
-            score += math.log1p(model.iso_support)
         protein_hit = proteins.best(model, min_protein_identity)
         if protein_hit:
             model.protein_coverage, model.protein_query_coverage, model.protein_identity, hit = protein_hit
             model.protein_target = hit.target
-            score += 3.0 * model.protein_coverage
-        model.score = score
+
+        if model.iso_support >= min_iso:
+            model.structure_status = "exact_isoseq"
+        elif not has_rna:
+            model.structure_status = "untested"
+        elif model.cds_introns and model.junctions_supported == model.junctions_total:
+            model.structure_status = "supported"
+        elif not model.cds_introns and model.coverage >= 0.5 and model.depth >= 10:
+            model.structure_status = "supported"
+        elif model.junctions_supported or model.iso_support or model.depth > 0:
+            model.structure_status = "partial"
+        else:
+            model.structure_status = "unsupported"
 
 
 def model_has_expression(model, sj, iso, args):
@@ -715,8 +734,44 @@ def chain_groups(locus):
     return groups
 
 
+def descending_rank(metrics, tie):
+    return tuple(-float(value) for value in metrics) + (tie,)
+
+
+def model_rank(model):
+    structure_rank = {"exact_isoseq": 3, "supported": 2, "partial": 1}.get(model.structure_status, 0)
+    metrics = (structure_rank, model.complete_cds, model.structure_coverage, model.iso_support,
+               model.depth, model.coverage, model.protein_coverage, model.protein_query_coverage,
+               model.protein_identity, model.source_weight)
+    return descending_rank(metrics, model.key)
+
+
 def best_in_group(group):
-    return sorted(group, key=lambda m: (-m.score, -m.cds_len, m.key))[0]
+    return sorted(group, key=model_rank)[0]
+
+
+def representative_basis(item, args):
+    model, _, reason, _ = item
+    if model.iso_support >= args.min_isoform_molecules:
+        return 5, "isoseq_chain_abundance"
+    if model.rna_supported:
+        return 4, "rna_structure_depth"
+    if model.protein_supported:
+        return 3, "protein_coverage"
+    if reason == "tandem_family_support":
+        return 2, "family_support"
+    if reason.endswith("set_chain_consensus"):
+        return 1, "input_consensus"
+    return 0, "trusted_source"
+
+
+def representative_rank(item, args):
+    model, _, _, sources = item
+    evidence_rank, _ = representative_basis(item, args)
+    protein_metrics = (model.protein_coverage, model.protein_query_coverage, model.protein_identity) if evidence_rank == 3 else (0, 0, 0)
+    metrics = (evidence_rank, model.complete_cds, model.structure_coverage, model.iso_support,
+               model.depth, model.coverage) + protein_metrics + (len(sources), model.source_weight)
+    return descending_rank(metrics, model.key)
 
 
 def choose_representatives(loci, sj, iso, proteins, args, trusted, tandem_info):
@@ -726,6 +781,7 @@ def choose_representatives(loci, sj, iso, proteins, args, trusted, tandem_info):
         kept = []
         for group in chain_groups(locus):
             best = best_in_group(group)
+            best.protein_supported = model_has_protein(best, proteins, args)
             family = tandem_info.get(best.key, {})
             sources = {m.set_name for m in group}
             if len(sources) >= 2:
@@ -746,21 +802,22 @@ def choose_representatives(loci, sj, iso, proteins, args, trusted, tandem_info):
                     dropped[model.key] = "unique_no_evidence"
                 continue
             kept.append((best, group, reason, sources))
-        kept.sort(key=lambda item: (-item[0].score, -item[0].cds_len, item[0].key))
+        kept.sort(key=lambda item: representative_rank(item, args))
         surviving = []
         for item in kept:
             best = item[0]
             if any(best.strand == other[0].strand and max(reciprocal_cds_overlap(best, other[0])) > args.conflict_overlap
                    for other in surviving):
                 for model in item[1]:
-                    dropped[model.key] = "locus_conflict_lower_score"
+                    dropped[model.key] = "locus_conflict_lower_rank"
             else:
                 surviving.append(item)
         for best, group, reason, sources in surviving:
             for model in group:
                 if model is not best:
-                    dropped[model.key] = "same_chain_lower_score"
-            winners.append({"model": best, "group": group, "reason": reason,
+                    dropped[model.key] = "same_chain_lower_rank"
+            _, selection = representative_basis((best, group, reason, sources), args)
+            winners.append({"model": best, "group": group, "reason": reason, "selection": selection,
                             "sources": sources, "locus": locus, "alternatives": []})
     return winners, dropped
 
@@ -926,7 +983,7 @@ def attach_isoforms(winners, sj, iso, genome, args):
             if not valid_alternative(model, sj, iso, genome, args):
                 continue
             candidates.append((support, model))
-        candidates.sort(key=lambda item: (-item[0], -item[1].score, item[1].key))
+        candidates.sort(key=lambda item: (-item[0],) + model_rank(item[1]))
         seen_chains = {primary.cds_introns}
         for support, model in candidates:
             if len(winner["alternatives"]) >= args.max_isoforms - 1:
@@ -960,7 +1017,7 @@ def utr_segments(exons, cds, strand):
 
 
 def model_row(model, kind, start, end, attributes, phase="."):
-    return "\t".join([model.chrom, "GFFmerge", kind, str(start), str(end), ".",
+    return "\t".join([model.chrom, "RefAnno", kind, str(start), str(end), ".",
                       model.strand, str(phase), attr_text(attributes)])
 
 
@@ -1012,10 +1069,11 @@ def write_outputs(winners, dropped, models, genome, args):
             open(os.path.join(args.outdir, "decision_report.tsv"), "w", newline="") as report:
         gff.write("##gff-version 3\n")
         fields = ["gene_id", "transcript_id", "role", "chrom", "start", "end", "strand", "source_model",
-                  "score", "cds_depth", "cds_coverage", "cds_multi_depth", "cds_multi_coverage",
-                  "family_support", "isoform_molecules", "protein_target",
+                  "structure_status", "structure_coverage", "junctions_supported", "junctions_total",
+                  "canonical_junctions", "complete_cds", "cds_depth", "cds_coverage", "cds_multi_depth",
+                  "cds_multi_coverage", "family_support", "isoform_molecules", "protein_target",
                   "protein_identity", "protein_coverage", "protein_query_coverage", "duplicate_type",
-                  "duplicate_cluster", "duplicate_size", "support", "reason", "review"]
+                  "duplicate_cluster", "duplicate_size", "support", "reason", "selection", "review"]
         writer = csv.DictWriter(report, fieldnames=fields, delimiter="\t", extrasaction="ignore")
         writer.writeheader()
         for index, winner in enumerate(winners, 1):
@@ -1029,7 +1087,12 @@ def write_outputs(winners, dropped, models, genome, args):
             gene_attrs = [("ID", gene_id), ("gene_biotype", "protein_coding"),
                           ("support", "+".join(sorted(winner["sources"]))),
                           ("source_model", model.source_model), ("reason", winner["reason"]),
-                          ("score", f"{model.score:.2f}"), ("cds_depth", f"{model.depth:.2f}"),
+                          ("selection", winner["selection"]), ("structure_status", model.structure_status),
+                          ("structure_coverage", f"{model.structure_coverage:.3f}"),
+                          ("junctions_supported", model.junctions_supported),
+                          ("junctions_total", model.junctions_total),
+                          ("canonical_junctions", model.canonical_junctions),
+                          ("complete_cds", int(model.complete_cds)), ("cds_depth", f"{model.depth:.2f}"),
                           ("cds_coverage", f"{model.coverage:.3f}"),
                           ("cds_multi_depth", f"{model.multi_depth:.2f}"),
                           ("cds_multi_coverage", f"{model.multi_coverage:.3f}"),
@@ -1049,7 +1112,13 @@ def write_outputs(winners, dropped, models, genome, args):
             transcript_count += 1
             writer.writerow({"gene_id": gene_id, "transcript_id": f"{gene_id}-T1", "role": "primary",
                              "chrom": model.chrom, "start": model.exons[0][0], "end": model.exons[-1][1],
-                             "strand": model.strand, "source_model": model.source_model, "score": f"{model.score:.3f}",
+                             "strand": model.strand, "source_model": model.source_model,
+                             "structure_status": model.structure_status,
+                             "structure_coverage": f"{model.structure_coverage:.3f}",
+                             "junctions_supported": model.junctions_supported,
+                             "junctions_total": model.junctions_total,
+                             "canonical_junctions": model.canonical_junctions,
+                             "complete_cds": int(model.complete_cds),
                              "cds_depth": f"{model.depth:.3f}", "cds_coverage": f"{model.coverage:.3f}",
                              "cds_multi_depth": f"{model.multi_depth:.3f}",
                              "cds_multi_coverage": f"{model.multi_coverage:.3f}",
@@ -1062,7 +1131,8 @@ def write_outputs(winners, dropped, models, genome, args):
                              "duplicate_cluster": duplicate["cluster"] if duplicate else "",
                              "duplicate_size": duplicate["size"] if duplicate else "",
                              "support": "+".join(sorted(winner["sources"])),
-                             "reason": winner["reason"], "review": ",".join(sorted(set(model.review)))})
+                             "reason": winner["reason"], "selection": winner["selection"],
+                             "review": ",".join(sorted(set(model.review)))})
             for rank, (alternative, support) in enumerate(alternatives, 2):
                 retained.add(alternative.key)
                 alternative.output_id = gene_id
@@ -1071,7 +1141,13 @@ def write_outputs(winners, dropped, models, genome, args):
                 writer.writerow({"gene_id": gene_id, "transcript_id": f"{gene_id}-T{rank}", "role": "alternative",
                                  "chrom": alternative.chrom, "start": alternative.exons[0][0],
                                  "end": alternative.exons[-1][1], "strand": alternative.strand,
-                                 "source_model": alternative.source_model, "score": f"{alternative.score:.3f}",
+                                 "source_model": alternative.source_model,
+                                 "structure_status": alternative.structure_status,
+                                 "structure_coverage": f"{alternative.structure_coverage:.3f}",
+                                 "junctions_supported": alternative.junctions_supported,
+                                 "junctions_total": alternative.junctions_total,
+                                 "canonical_junctions": alternative.canonical_junctions,
+                                 "complete_cds": int(alternative.complete_cds),
                                  "cds_depth": f"{alternative.depth:.3f}", "cds_coverage": f"{alternative.coverage:.3f}",
                                  "cds_multi_depth": f"{alternative.multi_depth:.3f}",
                                  "cds_multi_coverage": f"{alternative.multi_coverage:.3f}",
@@ -1084,7 +1160,8 @@ def write_outputs(winners, dropped, models, genome, args):
                                  "duplicate_cluster": duplicate["cluster"] if duplicate else "",
                                  "duplicate_size": duplicate["size"] if duplicate else "",
                                  "support": alternative.set_name,
-                                 "reason": "isoseq_exact_chain", "review": ""})
+                                 "reason": "isoseq_exact_chain", "selection": "isoseq_chain_abundance",
+                                 "review": ""})
 
     with open(os.path.join(args.outdir, "dropped.gff3"), "w") as out:
         out.write("##gff-version 3\n")
@@ -1113,6 +1190,10 @@ def write_outputs(winners, dropped, models, genome, args):
         "utr_consensus_changed": sum(bool(w.get("utr_changed")) for w in winners),
         "protein_supported_transcripts": sum(m.protein_coverage > 0 for m in models),
         "protein_only_retained_genes": sum(w["reason"] == "unique_with_protein" for w in winners),
+        "structure_supported_genes": sum(w["model"].structure_status in {"exact_isoseq", "supported"} for w in winners),
+        "structure_partial_genes": sum(w["model"].structure_status == "partial" for w in winners),
+        "structure_untested_genes": sum(w["model"].structure_status == "untested" for w in winners),
+        "representative_basis": dict(Counter(w["selection"] for w in winners)),
         "tandem_clusters": len({d["cluster"] for d in duplicate_info.values() if d["type"] == "tandem"}),
         "tandem_genes": sum(d["type"] == "tandem" for d in duplicate_info.values()),
         "duplicate_clusters": len({d["cluster"] for d in duplicate_info.values() if d["type"] == "duplicate"}),
@@ -1137,10 +1218,10 @@ def named_paths(specs):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
-                                     epilog="示例：\n  python3 GFFmerge.py --set annevo=a.gff3 --set helixer=h.gff3 "
+                                     epilog="示例：\n  python3 RefAnno.py --set annevo=a.gff3 --set helixer=h.gff3 "
                                             "--genome genome.fa --proteins related.faa --bam RNA.bam "
-                                            "--outdir GFFmerge_out")
-    parser.add_argument("--version", action="version", version="GFFmerge 1.0.0")
+                                            "--outdir RefAnno_out")
+    parser.add_argument("--version", action="version", version="RefAnno 1.0.0")
     parser.add_argument("--set", action="append", required=True, metavar="NAME=GFF", help="输入注释，可多次")
     parser.add_argument("--genome", required=True, help="基因组 FASTA")
     parser.add_argument("--sj", action="append", default=[], help=argparse.SUPPRESS)
@@ -1154,7 +1235,7 @@ def parse_args(argv=None):
     parser.add_argument("--min-protein-query-coverage", type=float, default=0.5, help="命中对查询蛋白的最低覆盖")
     parser.add_argument("--isoseq", action="append", default=[], help="可选：Iso-seq BAM 或 BED12 读链，可多次")
     parser.add_argument("--outdir", required=True)
-    parser.add_argument("--id-prefix", default="GFFM")
+    parser.add_argument("--id-prefix", default="REFA")
     parser.add_argument("--max-isoforms", type=int, default=3, help="每基因总转录本上限，含主代表")
     parser.add_argument("--min-isoform-molecules", type=int, default=2)
     parser.add_argument("--min-cds-coverage", type=float, default=0.9)
@@ -1216,8 +1297,8 @@ def main(argv=None):
         weights = {"egapx": 3.0, "eviann": 3.0, "e": 3.0, "braker": 2.0, "helixer": 1.0, "annevo": 1.0}
         for name, value in named_paths(args.set_weight):
             weights[name.lower()] = float(value)
-        score_models(models, sj, iso, protein_evidence, depth, genome, weights, args.min_sj,
-                     args.min_isoform_molecules, args.min_cds_coverage, args.min_protein_identity)
+        evaluate_models(models, sj, iso, protein_evidence, depth, genome, weights, args.min_sj,
+                        args.min_isoform_molecules, args.min_cds_coverage, args.min_protein_identity)
     finally:
         depth.close()
     loci = cluster_loci(models)
