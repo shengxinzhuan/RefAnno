@@ -1,8 +1,10 @@
 import argparse
 import json
 import sys
+from datetime import datetime, timezone
 
 from . import DESCRIPTION, __version__
+from .audit import write_run_manifest
 from .adjudication import choose_representatives, cluster_loci, evaluate_models, prepare_tandem_evidence
 from .consensus import apply_utr_consensus, attach_isoforms
 from .evidence import (
@@ -59,6 +61,8 @@ def parse_args(argv=None):
     parser.add_argument("--tandem-cds-ratio", type=float, default=1.8, help="串联重复相邻基因最大 CDS 长度比")
     parser.add_argument("--tandem-min-members", type=int, default=3, help="tandem 簇最少成员数；默认 2 成员标 duplicate")
     parser.add_argument("--tandem-min-multi-depth", type=float, default=5.0, help="串联家族多重比对 CDS 深度下限")
+    parser.add_argument("--tandem-min-protein-similarity", type=float, default=0.7,
+                        help="重复家族共享证据的最低蛋白序列相似度")
     parser.add_argument("--trusted-set", action="append", default=[], help="允许无 RNA 证据单独保留的集合名")
     parser.add_argument("--set-weight", action="append", default=[], metavar="NAME=FLOAT")
     parser.add_argument("--utr-consensus", action="store_true", help="用 Iso-seq 局部主导链替换 UTR 外显子，CDS 不变")
@@ -68,7 +72,8 @@ def parse_args(argv=None):
     if args.max_isoforms < 1 or args.max_isoforms > 3:
         parser.error("--max-isoforms 必须为 1–3")
     thresholds = [args.min_cds_coverage, args.utr_dominance, args.conflict_overlap,
-                  args.min_protein_identity, args.min_protein_coverage, args.min_protein_query_coverage]
+                  args.min_protein_identity, args.min_protein_coverage, args.min_protein_query_coverage,
+                  args.tandem_min_protein_similarity]
     if any(not 0 <= value <= 1 for value in thresholds):
         parser.error("覆盖度、主导度、一致性和冲突重叠阈值必须在 0–1 之间")
     if args.min_isoform_molecules < 1 or args.utr_min_molecules < 1 or args.min_sj < 1 or args.threads < 1:
@@ -79,6 +84,7 @@ def parse_args(argv=None):
 
 
 def run(argv=None):
+    started = datetime.now(timezone.utc)
     args = parse_args(argv)
     genome = Genome(args.genome)
     models = []
@@ -117,14 +123,15 @@ def run(argv=None):
         depth.close()
     loci = cluster_loci(models)
     trusted = {"egapx", "eviann", "e"} | {x.lower() for x in args.trusted_set}
-    tandem_info = prepare_tandem_evidence(loci, sj, protein_evidence, args)
-    winners, dropped = choose_representatives(loci, sj, iso, protein_evidence, args, trusted, tandem_info)
+    tandem_info = prepare_tandem_evidence(loci, sj, protein_evidence, genome, args)
+    winners, dropped, relations = choose_representatives(loci, sj, iso, protein_evidence, args, trusted, tandem_info)
     print(f"selected {len(winners)} primary genes from {len(loci)} loci", flush=True)
     if args.utr_consensus:
         apply_utr_consensus(winners, iso, args)
     if args.max_isoforms > 1 and len(iso):
         attach_isoforms(winners, sj, iso, genome, args)
-    summary = write_outputs(winners, dropped, models, genome, args)
+    summary = write_outputs(winners, dropped, relations, models, sj, iso, genome, args)
+    write_run_manifest(args, argv, started, summary)
     print(json.dumps(summary, ensure_ascii=False), flush=True)
     print(f"输出目录：{args.outdir}", flush=True)
     return summary

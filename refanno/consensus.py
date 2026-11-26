@@ -22,7 +22,7 @@ def consensus_exons(reads, node_window=3, end_window=50):
         else:
             clusters.append([read])
     if not clusters:
-        return None, 0, 0.0
+        return None, 0, 0.0, []
     best = max(clusters, key=lambda c: (len(c), -c[0].start, c[0].read_id))
     n = len(best[0].exons)
     medians = []
@@ -31,7 +31,7 @@ def consensus_exons(reads, node_window=3, end_window=50):
                         sorted(r.exons[i][1] for r in best)[len(best) // 2]))
     medoid = min(best, key=lambda r: (sum(abs(r.exons[i][0] - medians[i][0]) +
                                              abs(r.exons[i][1] - medians[i][1]) for i in range(n)), r.read_id))
-    return medoid, len(best), len(best) / len(reads)
+    return medoid, len(best), len(best) / len(reads), best
 
 
 def apply_utr_consensus(winners, iso, args):
@@ -40,7 +40,7 @@ def apply_utr_consensus(winners, iso, args):
         reads = iso.utr_compatible(model, args.min_cds_coverage)
         if len(reads) < args.utr_min_molecules:
             continue
-        best, support, dominance = consensus_exons(reads)
+        best, support, dominance, members = consensus_exons(reads)
         if support < args.utr_min_molecules or dominance < args.utr_dominance:
             model.review.append("utr_consensus_ambiguous")
             continue
@@ -51,6 +51,12 @@ def apply_utr_consensus(winners, iso, args):
         model.exons = sorted(best.exons)
         model.utr_note = f"{best.read_id}:n={support}:frac={dominance:.2f}"
         winner["utr_changed"] = old != model.exons
+        if winner["utr_changed"]:
+            winner["change"] = {
+                "type": "UTR_consensus", "old_exons": old, "new_exons": list(model.exons),
+                "molecules": [read.read_id for read in members], "support": support,
+                "dominance": dominance,
+            }
 
 
 def valid_alternative(model, sj, iso, genome, args):

@@ -48,7 +48,7 @@ def make_read(name, start, cigar):
     return read
 
 
-def build_single_exon(root):
+def build_single_exon(root, related_duplicates=True):
     random.seed(17)
     length = 100000
     genome = list("A" * length)
@@ -64,6 +64,8 @@ def build_single_exon(root):
     set_orf(1201, 399)
     protein_seq = set_orf(30001, 303)
     dup_seq = set_orf(50001, 600)
+    if not related_duplicates:
+        set_orf(50001, 600)
     set_orf(51201, 600, [dup_seq[i:i + 3] for i in range(3, len(dup_seq) - 3, 3)])
     set_orf(70001, 300)
     write_fasta(root / "genome.fa", genome)
@@ -153,5 +155,5 @@ def build_multiexon(root):
 
     with (root / "iso.bed12").open("w") as out:
         for name, second in (("A1", 2001), ("A2", 2001), ("B1", 3001), ("B2", 3001)):
-            offset = second - 1001
-            out.write(f"chr1\t1000\t{second + 149}\t{name}\t60\t+\t1000\t{second + 149}\t0\t2\t150,150,\t0,{offset},\n")
+            offset = second - 901
+            out.write(f"chr1\t900\t{second + 199}\t{name}\t60\t+\t900\t{second + 199}\t0\t2\t250,200,\t0,{offset},\n")

@@ -91,6 +91,8 @@ class Model:
     multi_depth: float = 0.0
     multi_coverage: float = 0.0
     family_support: str = ""
+    family_cluster: str = ""
+    family_donors: list = field(default_factory=list)
     iso_support: int = 0
     protein_coverage: float = 0.0
     protein_identity: float = 0.0

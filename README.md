@@ -189,16 +189,19 @@ duplicate_size=3
 --tandem-cds-ratio 1.8
 --tandem-min-members 3
 --tandem-min-multi-depth 5
+--tandem-min-protein-similarity 0.7
 ```
 
 这些条件识别的是位置和结构相似的**候选重复簇**，不等同于经过序列系统发育验证的同源家族。
 
 ### 重复家族参与的保留裁决
 
-重复信息不仅用于输出标签，也会在主代表选择前参与候选模型的保留判断。处理原则是：**结构相似的独立拷贝可以共享家族级证据，但不能共享精确到某个拷贝的证据。**
+重复信息不仅用于输出标签，也会在主代表选择前参与候选模型的保留判断。处理原则是：**真正相关的独立拷贝可以共享家族级证据，但不能共享精确到某个拷贝的证据。**
+
+位置和结构相似只用于形成候选簇。跨拷贝共享证据前，两个成员还须具有相同的蛋白靶标，或蛋白序列相似度达到 `--tandem-min-protein-similarity`（默认 0.7）。序列相似度使用蛋白全局编辑距离按较长序列归一化；没有相关成员的模型不能形成家族救援。
 
 - unique read 深度、unique junction 和 Iso-seq 完整链仍只归属于实际匹配的模型，不在家族成员之间传递。
-- 任一成员有合格蛋白支持时，可形成家族级蛋白证据。这对每个蛋白只保留一个最优命中的情况尤其有用，其他拷贝不会被误判为完全无同源支持。
+- 相关成员有合格蛋白支持时，可形成家族级蛋白证据。这对每个蛋白只保留一个最优命中的情况尤其有用，其他拷贝不会被误判为完全无同源支持。
 - 多重比对 CDS 覆盖 ≥0.5 且平均深度 ≥5 时，形成 `multi_depth` 家族证据。默认阈值可用 `--tandem-min-multi-depth` 调整。
 - 多重比对 junction 支持达到普通 junction 阈值的 3 倍时，形成 `multi_junction` 家族证据。
 - 单套注释中的候选重复成员可凭上述家族证据保留，原因是 `tandem_family_support`，并同时进入复核标签，避免与精确 unique 支持混淆。
@@ -206,7 +209,7 @@ duplicate_size=3
 
 **二联体 `duplicate` 与多成员串联簇 `tandem` 享有相同的家族救援规则。** 一个成员有合格蛋白或家族级多重比对证据时，另一个成员也可保留。两类关系统一使用 `tandem_family_support` 作为保留原因。
 
-输出中的 `family_support` 记录具体来源，如 `protein`、`multi_depth`、`multi_junction` 或其组合；`cds_multi_depth` 和 `cds_multi_coverage` 记录模型自身的多重比对覆盖。`summary.json` 的 `tandem_family_retained_genes` 同时统计二联体和多成员串联簇。
+输出中的 `family_support` 记录具体来源，如 `protein`、`multi_depth`、`multi_junction` 或其组合；`family_donors` 和 `family_rescues.tsv` 进一步记录证据来自哪个模型、哪个最终基因和哪个重复簇。`cds_multi_depth` 和 `cds_multi_coverage` 记录模型自身的多重比对覆盖。`summary.json` 的 `tandem_family_retained_genes` 同时统计二联体和多成员串联簇。
 
 ## 二代深度
 
@@ -314,7 +317,7 @@ samtools index -c isoseq.bam
 --outdir DIR                输出目录，必需
 ```
 
-蛋白比对结果会在输出目录缓存并自动复用。输入蛋白更新后，建议使用新的输出目录重新运行。
+蛋白比对结果会在输出目录缓存。缓存按基因组、蛋白、miniprot 版本、线程数和选项的 SHA256 指纹校验，任一项改变即自动失效并重新比对，不需要手动换输出目录。
 
 ## 工程结构与测试
 
@@ -327,7 +330,8 @@ refanno/
 ├── evidence.py        GFF/BAM/BED12、蛋白与深度证据
 ├── adjudication.py    结构评估、保留和代表裁决
 ├── consensus.py       UTR 共识与可变剪切
-└── output.py          GFF3、蛋白、报告和摘要输出
+├── output.py          GFF3、蛋白、报告和摘要输出
+└── audit.py           运行清单与输入输出校验和
 ```
 
 `RefAnno.py` 是源码兼容入口；安装后的 `refanno` 和 `python -m refanno` 使用同一个 `refanno.cli` 主流程。输出摘要有独立的 `output_schema_version`，报告列由端到端测试固定。
@@ -339,7 +343,7 @@ python -m pip install --no-deps -e .
 python -m unittest discover -v
 ```
 
-测试覆盖真实合成 BAM 的深度与 junction、蛋白保留、重复家族救援、代表选择、Iso-seq 可变剪切、UTR 共识和报告格式。环境中有 miniprot 时还会运行蛋白 FASTA 自动比对集成测试；也可用 `REFANNO_MINIPROT=/path/to/miniprot` 指定可执行文件。GitHub Actions 对推送和 Pull Request 运行同一套测试。
+测试共 6 个端到端用例，覆盖真实合成 BAM 的深度与 junction、蛋白保留、重复家族救援及其 donor 记录、非同源相邻模型不得互相救援的反例、同座位冲突关系、代表优先级、Iso-seq 可变剪切、真实 UTR 修订的 `changes.tsv` 记录，以及 miniprot 缓存复用与输入改变后的缓存失效。环境中有 miniprot 时还会运行蛋白 FASTA 自动比对集成测试；也可用 `REFANNO_MINIPROT=/path/to/miniprot` 指定可执行文件。GitHub Actions 对推送和 Pull Request 运行同一套测试。
 
 ## 输出
 
@@ -347,19 +351,51 @@ python -m unittest discover -v
 |---|---|
 | `final.gff3` | 最终基因、mRNA、exon、CDS 和 UTR，可载入 IGV |
 | `final.proteins.faa` | 按最终 CDS 翻译的全部转录本蛋白 |
-| `decision_report.tsv` | 结构状态、保留原因、代表依据及各类证据指标 |
-| `dropped.gff3` | 未保留模型及原因 |
-| `summary.json` | 软件与输出格式版本，以及基因、转录本、结构状态和修订统计 |
+| `decision_report.tsv` | 结构状态、证据等级、保留原因、代表依据及各类证据指标 |
+| `decision_events.tsv` | 每个输入模型的去向：主代表、替代转录本或淘汰，以及原因和相关模型 |
+| `junction_evidence.tsv` | 逐 junction 的 unique/multi reads、Iso-seq 分子、motif 和支持状态 |
+| `supporting_junctions.bed` | 最终主代表和替代转录本的支持 junction，可直接载入 IGV |
+| `family_rescues.tsv` | 被家族证据救援的基因、donor 模型、重复簇、证据类型和数值 |
+| `changes.tsv` | UTR 共识修订前后 exon、CDS 是否改变、支持分子和主导度 |
+| `review.gff3` | 需要人工复查的模型：部分结构支持、间接救援或无结构支持 |
+| `conflicting_models.gff3` | 同座位冲突中被淘汰的模型及其获胜基因 |
+| `dropped.gff3` | 其余未保留模型及原因 |
+| `input_fates.tsv` | 每套输入的模型数、完整 CDS 数、结构支持数和最终去向 |
+| `qc_report.html` | 离线 QC 报告，汇总证据等级、复查项和结构变更 |
+| `summary.json` | 软件与输出格式版本，以及基因、转录本、结构状态、修订和证据等级统计 |
+| `run_manifest.json` | 命令、参数、运行环境版本、起止时间、输入输出文件大小与 SHA256 |
+| `miniprot.cache.json` | 蛋白比对缓存指纹，输入或参数改变时自动失效 |
 
 `decision_report.tsv` 不再提供混合 `score`。主要字段包括：
 
 - `structure_status`、`structure_coverage`、`junctions_supported`、`junctions_total`：结构可信程度；
+- `evidence_class`：模型最终依据的最高证据等级，含义见下节；
 - `reason`：基因保留原因；
 - `selection`：主代表选择依据；
 - `cds_depth`、`cds_coverage`、`isoform_molecules`：转录证据；
 - `protein_target`、`protein_identity`、`protein_coverage`、`protein_query_coverage`：同源蛋白证据；
-- `family_support`、`duplicate_type/cluster/size`：重复家族证据与标记；
+- `family_support`、`family_donors`、`duplicate_type/cluster/size`：重复家族证据、donor 与标记；
 - `review`：内部终止子、家族间接保留或 UTR 共识不确定等复核标签。
+
+`summary.json` 中的 `review_genes` 和 `structural_changes` 分别给出需要复查的基因数和实际发生 UTR 修订的基因数，`evidence_classes` 按等级统计最终基因。
+
+## 证据链与复查
+
+每个最终基因都带有 `evidence_class`，表示它依据的最高证据等级，从强到弱为：
+
+| 等级 | 含义 |
+|---|---|
+| `isoseq_exact` | 完整 CDS 剪接链有 Iso-seq 分子精确支持 |
+| `short_read_complete` | 全部 CDS junction 有二代支持，或单外显子达到覆盖和深度要求 |
+| `short_read_partial` | 有部分二代 RNA 证据，但结构未全部支持 |
+| `homology_only` | 没有可达阈值的 RNA 结构支持，凭合格同源蛋白保留 |
+| `family_indirect` | 凭重复家族的间接证据保留，自身无直接证据 |
+| `untested` | 没有 RNA 数据，无法评价转录结构 |
+| `annotation_only` | 有 RNA 数据但未获结构支持，也未进入其他通道 |
+
+推荐的 IGV 复查方式是同时载入 `final.gff3`、`review.gff3` 和 `supporting_junctions.bed`：`final.gff3` 查看保留结果，`review.gff3` 高亮需要复核的模型，`supporting_junctions.bed` 直接对照 BAM 中的剪接位点。发现可疑基因后，再到 `decision_report.tsv` 查看该基因的证据指标和 `review` 标签，在 `decision_events.tsv` 追溯同座位被淘汰的模型，在 `junction_evidence.tsv` 查看逐 junction 的 reads 支持。`family_indirect` 的基因可沿 `family_rescues.tsv` 找到提供证据的 donor 模型。
+
+`qc_report.html` 不依赖外部资源，可直接用浏览器打开。基因数量和 BUSCO 不能单独证明结构正确，QC 报告因此以证据等级分布、复查清单和结构变更为主线，而不是只给一个通过比例。
 
 ## 许可证
 

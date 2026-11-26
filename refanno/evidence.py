@@ -4,6 +4,7 @@ import re
 import subprocess
 from collections import Counter, defaultdict
 
+from .audit import executable_version, file_sha256, read_json, write_json
 from .models import (
     TX_TYPES,
     IsoChain,
@@ -244,18 +245,34 @@ def load_protein_lengths(path):
 def run_miniprot(genome, proteins, executable, threads, outdir):
     os.makedirs(outdir, exist_ok=True)
     output = os.path.join(outdir, "miniprot.gff3")
-    if os.path.exists(output) and os.path.getsize(output) > 0:
-        print(f"miniprot: reuse {output}", flush=True)
-        return output
+    cache_path = os.path.join(outdir, "miniprot.cache.json")
+    fingerprint = {
+        "genome_sha256": file_sha256(genome), "proteins_sha256": file_sha256(proteins),
+        "miniprot_version": executable_version(executable), "threads": threads,
+        "options": ["--gff", "--outn=1"],
+    }
+    if os.path.isfile(output) and os.path.getsize(output) > 0 and os.path.isfile(cache_path):
+        try:
+            if read_json(cache_path) == fingerprint:
+                print(f"miniprot: reuse {output}", flush=True)
+                return output
+        except (OSError, ValueError):
+            pass
     command = [executable, "-t", str(threads), "--gff", "--outn=1", genome, proteins]
     print("miniprot: " + " ".join(command), flush=True)
+    temporary = output + ".tmp"
     try:
-        with open(output, "w") as handle:
+        with open(temporary, "w") as handle:
             subprocess.run(command, stdout=handle, check=True)
+        os.replace(temporary, output)
+        write_json(cache_path, fingerprint)
     except FileNotFoundError as exc:
         raise RuntimeError("找不到 miniprot；请安装后用 --miniprot 指定可执行文件路径") from exc
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(f"miniprot 运行失败，退出码 {exc.returncode}") from exc
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
     return output
 
 

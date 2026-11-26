@@ -173,9 +173,24 @@ def representative_rank(item, args):
     return descending_rank(metrics, model.key)
 
 
+def evidence_class(model, reason, args):
+    if model.iso_support >= args.min_isoform_molecules:
+        return "isoseq_exact"
+    if model.rna_supported:
+        return "short_read_complete" if model.structure_status == "supported" else "short_read_partial"
+    if model.protein_supported:
+        return "homology_only"
+    if reason == "tandem_family_support":
+        return "family_indirect"
+    if model.structure_status == "untested":
+        return "untested"
+    return "annotation_only"
+
+
 def choose_representatives(loci, sj, iso, proteins, args, trusted, tandem_info):
     winners = []
     dropped = {}
+    relations = {}
     for locus in loci:
         kept = []
         for group in chain_groups(locus):
@@ -194,31 +209,42 @@ def choose_representatives(loci, sj, iso, proteins, args, trusted, tandem_info):
             elif family.get("family_support") and "internal_stop" not in best.review:
                 reason = "tandem_family_support"
                 best.family_support = family["family_support"]
+                best.family_cluster = family["cluster"]
+                best.family_donors = family["family_donors"]
                 if "tandem_family_support" not in best.review:
                     best.review.append("tandem_family_support")
             else:
                 for model in group:
                     dropped[model.key] = "unique_no_evidence"
+                    relations[model.key] = {"rule": "retention"}
                 continue
             kept.append((best, group, reason, sources))
         kept.sort(key=lambda item: representative_rank(item, args))
         surviving = []
         for item in kept:
             best = item[0]
-            if any(best.strand == other[0].strand and max(reciprocal_cds_overlap(best, other[0])) > args.conflict_overlap
-                   for other in surviving):
+            conflict = next((other for other in surviving
+                             if best.strand == other[0].strand
+                             and max(reciprocal_cds_overlap(best, other[0])) > args.conflict_overlap), None)
+            if conflict is not None:
                 for model in item[1]:
                     dropped[model.key] = "locus_conflict_lower_rank"
+                    relations[model.key] = {
+                        "rule": "locus_conflict", "related_model": conflict[0].key,
+                        "overlap": reciprocal_cds_overlap(model, conflict[0]),
+                    }
             else:
                 surviving.append(item)
         for best, group, reason, sources in surviving:
             for model in group:
                 if model is not best:
                     dropped[model.key] = "same_chain_lower_rank"
+                    relations[model.key] = {"rule": "same_chain", "related_model": best.key}
             _, selection = representative_basis((best, group, reason, sources), args)
             winners.append({"model": best, "group": group, "reason": reason, "selection": selection,
+                            "evidence_class": evidence_class(best, reason, args),
                             "sources": sources, "locus": locus, "alternatives": []})
-    return winners, dropped
+    return winners, dropped, relations
 
 
 def detect_duplicate_clusters(models, args):
@@ -260,7 +286,45 @@ def detect_duplicate_clusters(models, args):
     return annotations
 
 
-def prepare_tandem_evidence(loci, sj, proteins, args):
+def protein_similarity(a, b):
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    if len(a) < len(b):
+        a, b = b, a
+    previous = list(range(len(b) + 1))
+    for i, left in enumerate(a, 1):
+        current = [i]
+        for j, right in enumerate(b, 1):
+            current.append(min(current[-1] + 1, previous[j] + 1,
+                               previous[j - 1] + (left != right)))
+        previous = current
+    return 1.0 - previous[-1] / max(len(a), len(b))
+
+
+def related_family_members(model, members, genome, args, sequence_cache, similarity_cache):
+    related = []
+    for other in members:
+        if other.key == model.key:
+            continue
+        pair = tuple(sorted((model.key, other.key)))
+        if pair not in similarity_cache:
+            same_target = bool(model.protein_target and model.protein_target == other.protein_target)
+            if same_target:
+                similarity_cache[pair] = True
+            else:
+                for item in (model, other):
+                    if item.key not in sequence_cache:
+                        sequence_cache[item.key] = translate(genome.cds_sequence(item)).rstrip("*")
+                similarity = protein_similarity(sequence_cache[model.key], sequence_cache[other.key])
+                similarity_cache[pair] = similarity >= args.tandem_min_protein_similarity
+        if similarity_cache[pair]:
+            related.append(other)
+    return related
+
+
+def prepare_tandem_evidence(loci, sj, proteins, genome, args):
     grouped_loci = [chain_groups(locus) for locus in loci]
     representatives = [best_in_group(group) for groups in grouped_loci for group in groups]
     annotations = detect_duplicate_clusters(representatives, args)
@@ -268,30 +332,43 @@ def prepare_tandem_evidence(loci, sj, proteins, args):
     for model in representatives:
         if model.key in annotations:
             cluster_members[annotations[model.key]["cluster"]].append(model)
-    cluster_support = {}
+    support_by_model = {}
+    donors_by_model = {}
+    sequence_cache = {}
+    similarity_cache = {}
     for cluster, members in cluster_members.items():
-        support = []
-        if any(model_has_protein(model, proteins, args) for model in members):
-            support.append("protein")
-        if any(model.multi_coverage >= 0.5 and model.multi_depth >= args.tandem_min_multi_depth
-               for model in members):
-            support.append("multi_depth")
-        multi_junction = 0
         for model in members:
-            for intron in model.cds_introns:
-                _, multi = sj.get(model, intron)
-                multi_junction = max(multi_junction, multi)
-        if multi_junction >= 3 * args.min_sj:
-            support.append("multi_junction")
-        cluster_support[cluster] = "+".join(support)
+            related = related_family_members(model, members, genome, args, sequence_cache, similarity_cache)
+            if not related:
+                continue
+            support = []
+            donors = []
+            for donor in [model] + related:
+                donor_support = []
+                if donor.key != model.key and model_has_protein(donor, proteins, args):
+                    donor_support.append(("protein", donor.protein_target, donor.protein_coverage))
+                if donor.multi_coverage >= 0.5 and donor.multi_depth >= args.tandem_min_multi_depth:
+                    donor_support.append(("multi_depth", "", donor.multi_depth))
+                multi_junction = max((sj.get(donor, intron)[1] for intron in donor.cds_introns), default=0)
+                if multi_junction >= 3 * args.min_sj:
+                    donor_support.append(("multi_junction", "", multi_junction))
+                for kind, target, value in donor_support:
+                    if kind not in support:
+                        support.append(kind)
+                    donors.append({"donor": donor.key, "evidence": kind,
+                                   "protein_target": target, "value": value})
+            support_by_model[model.key] = "+".join(support)
+            donors_by_model[model.key] = donors
     tandem_info = {}
     for groups in grouped_loci:
         for group in groups:
-            annotation = annotations.get(best_in_group(group).key)
+            representative = best_in_group(group)
+            annotation = annotations.get(representative.key)
             if not annotation:
                 continue
             annotation = dict(annotation)
-            annotation["family_support"] = cluster_support[annotation["cluster"]]
+            annotation["family_support"] = support_by_model.get(representative.key, "")
+            annotation["family_donors"] = donors_by_model.get(representative.key, [])
             for model in group:
                 tandem_info[model.key] = annotation
     return tandem_info
