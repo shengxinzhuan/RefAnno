@@ -111,6 +111,11 @@ def run(argv=None):
     if args.proteins and not miniprot_gff:
         miniprot_gff = run_miniprot(args.genome, args.proteins, args.miniprot, args.threads, args.outdir)
     protein_evidence = ProteinIndex(miniprot_gff or "", protein_lengths)
+    hits = [hit for values in protein_evidence.by_chrom.values() for hit in values]
+    identical = sum(1 for hit in hits if hit.identity >= 0.999)
+    if len(hits) >= 1000 and identical >= 0.3 * len(hits):
+        print(f"警告: 蛋白比对中 {100 * identical / len(hits):.0f}% 的命中一致性为 1.0；--proteins 可能来自同一基因组自身的预测，"
+              "蛋白支持会退化为自我确认，建议改用近缘物种或 Swiss-Prot 等独立来源的蛋白", file=sys.stderr, flush=True)
     print(f"evidence: {len(iso)} Iso-seq chains; {sum(len(v) for v in sj.data.values())} junctions; "
           f"{len(protein_evidence)} protein hits", flush=True)
     weights = {"egapx": 3.0, "eviann": 3.0, "e": 3.0, "braker": 2.0, "helixer": 1.0, "annevo": 1.0}
