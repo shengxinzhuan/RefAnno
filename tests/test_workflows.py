@@ -219,6 +219,40 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(bed_lines), 2)
         self.assert_manifest(outdir)
 
+    def test_depth_index_accumulator(self):
+        from refanno.evidence import DepthIndex, Genome, SJIndex, load_bam_junctions
+        from refanno.models import Model
+        from tests.synthetic import make_read, write_bam, write_fasta
+
+        write_fasta(self.root / "genome.fa", "A" * 2000)
+        multi = make_read("r2", 151, [(0, 200)])
+        multi.set_tag("NH", 3)
+        secondary = make_read("r4", 91, [(0, 160)])
+        secondary.is_secondary = True
+        supplementary = make_read("r5", 91, [(0, 160)])
+        supplementary.is_supplementary = True
+        reads = [make_read("r1", 91, [(0, 160)]), multi, make_read("r3", 291, [(0, 60), (3, 100), (0, 60)]),
+                 secondary, supplementary]
+        write_bam(self.root / "rna.bam", reads, 2000)
+
+        def model(name, blocks):
+            item = Model("setA", name, name, "chr1", "+")
+            item.cds = list(blocks)
+            item.finish()
+            return item
+
+        both = model("both", [(101, 200), (301, 400)])
+        shared = model("shared", [(101, 200)])
+        tail = model("tail", [(501, 600)])
+        bam = str(self.root / "rna.bam")
+        depth = DepthIndex([bam], [both, shared, tail])
+        sj = SJIndex()
+        load_bam_junctions([bam], Genome(str(self.root / "genome.fa")), sj, depth)
+        self.assertEqual(depth.get(both), (0.75, 0.75, 0.5, 0.5))
+        self.assertEqual(depth.get(shared), (1.0, 1.0, 0.5, 0.5))
+        self.assertEqual(depth.get(tail), (0.1, 0.1, 0.0, 0.0))
+        self.assertEqual(dict(sj.data["chr1"]), {(351, 450, "."): [1, 0]})
+
     def test_version(self):
         result = self.run_command([sys.executable, str(self.script), "--version"])
         self.assertEqual(result.stdout.strip(), "RefAnno 1.1.0")

@@ -213,7 +213,7 @@ duplicate_size=3
 
 ## 二代深度
 
-二代 BAM 的整链 CDS 平均深度只计一次，避免多内含子模型重复获得深度奖励。深度用于代表选择，不与蛋白支持混合成一个保留总分。unique/multi 深度和 junction 分开统计，多重比对证据不会伪装成某个拷贝的精确支持。
+RefAnno 对每个二代 BAM 顺序扫描一遍，在同一趟里提取 junction 并按 CDS 块累计深度，不按基因做随机查询，因此在大基因组和深度较高的 BAM 上耗时与 BAM 总大小成正比，而不随模型数量倍增。整链 CDS 平均深度只计一次，避免多内含子模型重复获得深度奖励。深度用于代表选择，不与蛋白支持混合成一个保留总分。unique/multi 深度和 junction 分开统计，多重比对证据不会伪装成某个拷贝的精确支持。
 
 ## 可选 Iso-seq 增强
 
@@ -266,7 +266,7 @@ samtools index -c Aligned.sortedByCoord.out.bam
 
 - `NH` 用于区分唯一比对和多重比对 reads；唯一比对用于 CDS 深度，junction 则分别累计 unique/multi 支持。
 - `XS` 提供转录链方向；缺少或不可靠时，RefAnno 会根据基因组剪接 motif 补充判定。
-- `--outSAMtype BAM SortedByCoordinate` 是必需的，因为程序按基因区间查询 BAM。
+- RefAnno 对每个 BAM **顺序扫描一遍**，同时提取 junction 和 CDS 深度，不按基因区间随机查询，因此不要求 BAM 已排序或建索引；排序和索引仍建议保留，供 IGV 等工具使用。
 - `samtools index -c` 生成 CSI 索引，适合长 scaffold/contig；普通染色体规模也可使用默认 BAI 索引。
 - `--twopassMode Basic` 有助于发现未注释 junction，适合给基因结构纠错提供证据。
 
@@ -343,7 +343,7 @@ python -m pip install --no-deps -e .
 python -m unittest discover -v
 ```
 
-测试共 6 个端到端用例，覆盖真实合成 BAM 的深度与 junction、蛋白保留、重复家族救援及其 donor 记录、非同源相邻模型不得互相救援的反例、同座位冲突关系、代表优先级、Iso-seq 可变剪切、真实 UTR 修订的 `changes.tsv` 记录，以及 miniprot 缓存复用与输入改变后的缓存失效。环境中有 miniprot 时还会运行蛋白 FASTA 自动比对集成测试；也可用 `REFANNO_MINIPROT=/path/to/miniprot` 指定可执行文件。GitHub Actions 对推送和 Pull Request 运行同一套测试。
+测试共 7 个端到端用例，覆盖真实合成 BAM 的深度与 junction（含深度累加器按唯一/多重分开、多 CDS 块求和的直接校验）、蛋白保留、重复家族救援及其 donor 记录、非同源相邻模型不得互相救援的反例、同座位冲突关系、代表优先级、Iso-seq 可变剪切、真实 UTR 修订的 `changes.tsv` 记录，以及 miniprot 缓存复用与输入改变后的缓存失效。环境中有 miniprot 时还会运行蛋白 FASTA 自动比对集成测试；也可用 `REFANNO_MINIPROT=/path/to/miniprot` 指定可执行文件。GitHub Actions 对推送和 Pull Request 运行同一套测试。
 
 ## 输出
 

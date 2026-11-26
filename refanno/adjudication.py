@@ -317,8 +317,14 @@ def related_family_members(model, members, genome, args, sequence_cache, similar
                 for item in (model, other):
                     if item.key not in sequence_cache:
                         sequence_cache[item.key] = translate(genome.cds_sequence(item)).rstrip("*")
-                similarity = protein_similarity(sequence_cache[model.key], sequence_cache[other.key])
-                similarity_cache[pair] = similarity >= args.tandem_min_protein_similarity
+                first, second = sequence_cache[model.key], sequence_cache[other.key]
+                longer, shorter = max(len(first), len(second)), min(len(first), len(second))
+                # 编辑距离至少是长度差，长度差已超出阈值允许的范围时不必算编辑距离
+                if longer - shorter > (1.0 - args.tandem_min_protein_similarity) * longer:
+                    similarity_cache[pair] = False
+                else:
+                    similarity = protein_similarity(first, second)
+                    similarity_cache[pair] = similarity >= args.tandem_min_protein_similarity
         if similarity_cache[pair]:
             related.append(other)
     return related

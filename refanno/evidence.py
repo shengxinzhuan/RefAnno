@@ -133,7 +133,7 @@ class SJIndex:
         return found
 
 
-def load_bam_junctions(paths, genome, sj, min_mapq=10, min_anchor=8):
+def load_bam_junctions(paths, genome, sj, depth=None, min_mapq=10, min_anchor=8):
     if not paths:
         return
     try:
@@ -142,18 +142,24 @@ def load_bam_junctions(paths, genome, sj, min_mapq=10, min_anchor=8):
         raise RuntimeError("读取 BAM 需要 pysam：conda install -c bioconda pysam") from exc
     for path in paths:
         with pysam.AlignmentFile(path, "rb") as bam:
+            if depth is not None and not set(bam.references) & set(depth.by_chrom):
+                raise RuntimeError(f"{path} 与注释没有共同的序列名，请检查 seqid 是否一致")
             for read in bam.fetch(until_eof=True):
-                if read.is_unmapped or read.is_secondary or read.is_supplementary or read.mapping_quality < min_mapq:
+                if read.is_unmapped or read.is_secondary or read.is_supplementary:
                     continue
-                try:
-                    xs = read.get_tag("XS")
-                except KeyError:
-                    xs = "."
+                if depth is not None:
+                    depth.consume(read)
+                if read.mapping_quality < min_mapq:
+                    continue
+                cigar = read.cigartuples
+                if not any(op == 3 for op, _ in (cigar or ())):
+                    continue
+                xs = read.get_tag("XS") if read.has_tag("XS") else "."
                 multi = read.get_tag("NH") > 1 if read.has_tag("NH") else False
                 ref = read.reference_start + 1
                 anchor = 0
                 pending = None
-                for op, length in read.cigartuples or []:
+                for op, length in cigar:
                     if op in {0, 7, 8}:
                         ref += length
                         anchor += length
@@ -170,6 +176,8 @@ def load_bam_junctions(paths, genome, sj, min_mapq=10, min_anchor=8):
                         pending = ((ref, ref + length - 1), anchor) if anchor >= min_anchor and 5 <= length <= 200000 else None
                         ref += length
                         anchor = 0
+    if depth is not None:
+        depth.finalize()
 
 
 class ProteinIndex:
@@ -414,20 +422,66 @@ def load_iso_bam(path, genome, min_mapq=10, min_anchor=20):
 
 
 class DepthIndex:
-    def __init__(self, paths):
-        self.cache = {}
-        if not paths:
-            self.bams = []
-            return
-        try:
-            import pysam
-        except ImportError as exc:
-            raise RuntimeError("--bam 需要 pysam；也可改用 --sj 与 BED12，纯标准库运行") from exc
-        self.bams = [pysam.AlignmentFile(path, "rb") for path in paths]
+    """BAM 顺序扫描时按 CDS 块累计深度；唯一/多重比对分开统计，扫描结束后一次求和。"""
 
-    def close(self):
-        for bam in self.bams:
-            bam.close()
+    def __init__(self, paths, models=()):
+        self.bams = list(paths)
+        self.blocks = {}
+        self.by_chrom = {}
+        self.index = None
+        self.results = {}
+        self.cache = {}
+        for model in models:
+            for start, end in model.cds:
+                self.add_block(model.chrom, start, end)
+
+    def add_block(self, chrom, start, end):
+        key = (chrom, start, end)
+        if key not in self.blocks:
+            size = end - start + 1
+            self.blocks[key] = ([0] * (size + 1), [0] * (size + 1))
+            self.by_chrom.setdefault(chrom, []).append(key)
+
+    def build_index(self):
+        self.index = {}
+        for chrom, keys in self.by_chrom.items():
+            keys.sort()
+            starts = [key[1] - 1 for key in keys]
+            longest = max(key[2] - key[1] + 1 for key in keys)
+            self.index[chrom] = (starts, keys, longest)
+
+    def consume(self, read):
+        if read.is_unmapped or read.is_secondary or read.is_supplementary:
+            return
+        if self.index is None:
+            self.build_index()
+        entry = self.index.get(read.reference_name)
+        if entry is None:
+            return
+        blocks = read.get_blocks()
+        if not blocks:
+            return
+        starts, keys, longest = entry
+        lo = bisect.bisect_left(starts, blocks[0][0] - longest)
+        hi = bisect.bisect_right(starts, blocks[-1][1] - 1)
+        if lo >= hi:
+            return
+        multi = int(read.has_tag("NH") and read.get_tag("NH") > 1)
+        for block_start, block_end in blocks:
+            for k in range(lo, hi):
+                key = keys[k]
+                offset = key[1] - 1
+                left = block_start if block_start > offset else offset
+                right = block_end if block_end < key[2] else key[2]
+                if left < right:
+                    diff = self.blocks[key][multi]
+                    diff[left - offset] += 1
+                    diff[right - offset] -= 1
+
+    def finalize(self):
+        for key, (unique, multi) in self.blocks.items():
+            self.results[key] = (summarize_depth(unique), summarize_depth(multi))
+        self.blocks = {}
 
     def get(self, model):
         key = (model.chrom, tuple(model.cds))
@@ -438,31 +492,24 @@ class DepthIndex:
         covered = [0, 0]
         total_depth = [0, 0]
         for start, end in model.cds:
-            size = end - start + 1
-            diffs = [[0] * (size + 1), [0] * (size + 1)]
-            for bam in self.bams:
-                try:
-                    reads = bam.fetch(model.chrom, start - 1, end)
-                except ValueError as exc:
-                    raise RuntimeError(f"BAM 无法按坐标查询，请先 samtools index：{exc}") from exc
-                for read in reads:
-                    if read.is_unmapped or read.is_secondary or read.is_supplementary:
-                        continue
-                    multi = read.has_tag("NH") and read.get_tag("NH") > 1
-                    diff = diffs[int(multi)]
-                    for block_start, block_end in read.get_blocks():
-                        left = max(start - 1, block_start)
-                        right = min(end, block_end)
-                        if left < right:
-                            diff[left - start + 1] += 1
-                            diff[right - start + 1] -= 1
-            for index, diff in enumerate(diffs):
-                current = 0
-                for value in diff[:size]:
-                    current += value
-                    total_depth[index] += current
-                    covered[index] += current > 0
-        result = (covered[0] / max(model.cds_len, 1), total_depth[0] / max(model.cds_len, 1),
-                  covered[1] / max(model.cds_len, 1), total_depth[1] / max(model.cds_len, 1))
+            result = self.results.get((model.chrom, start, end))
+            if result is None:
+                continue
+            for klass in (0, 1):
+                covered[klass] += result[klass][0]
+                total_depth[klass] += result[klass][1]
+        scale = max(model.cds_len, 1)
+        result = (covered[0] / scale, total_depth[0] / scale, covered[1] / scale, total_depth[1] / scale)
         self.cache[key] = result
         return result
+
+
+def summarize_depth(diff):
+    current = 0
+    covered = 0
+    total = 0
+    for value in diff[:-1]:
+        current += value
+        total += current
+        covered += current > 0
+    return covered, total

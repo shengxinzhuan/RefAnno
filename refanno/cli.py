@@ -97,7 +97,8 @@ def run(argv=None):
     sj = SJIndex()
     for path in args.sj:
         sj.load(path)
-    load_bam_junctions(args.bam, genome, sj)
+    depth = DepthIndex(args.bam, models)
+    load_bam_junctions(args.bam, genome, sj, depth)
     chains = []
     for path in args.isoseq:
         if path.lower().endswith((".bam", ".cram")):
@@ -112,15 +113,11 @@ def run(argv=None):
     protein_evidence = ProteinIndex(miniprot_gff or "", protein_lengths)
     print(f"evidence: {len(iso)} Iso-seq chains; {sum(len(v) for v in sj.data.values())} junctions; "
           f"{len(protein_evidence)} protein hits", flush=True)
-    depth = DepthIndex(args.bam)
-    try:
-        weights = {"egapx": 3.0, "eviann": 3.0, "e": 3.0, "braker": 2.0, "helixer": 1.0, "annevo": 1.0}
-        for name, value in named_paths(args.set_weight):
-            weights[name.lower()] = float(value)
-        evaluate_models(models, sj, iso, protein_evidence, depth, genome, weights, args.min_sj,
-                        args.min_isoform_molecules, args.min_cds_coverage, args.min_protein_identity)
-    finally:
-        depth.close()
+    weights = {"egapx": 3.0, "eviann": 3.0, "e": 3.0, "braker": 2.0, "helixer": 1.0, "annevo": 1.0}
+    for name, value in named_paths(args.set_weight):
+        weights[name.lower()] = float(value)
+    evaluate_models(models, sj, iso, protein_evidence, depth, genome, weights, args.min_sj,
+                    args.min_isoform_molecules, args.min_cds_coverage, args.min_protein_identity)
     loci = cluster_loci(models)
     trusted = {"egapx", "eviann", "e"} | {x.lower() for x in args.trusted_set}
     tandem_info = prepare_tandem_evidence(loci, sj, protein_evidence, genome, args)
