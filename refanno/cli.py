@@ -132,7 +132,8 @@ def run(argv=None):
         apply_utr_consensus(winners, iso, args)
     if args.max_isoforms > 1 and len(iso):
         attach_isoforms(winners, sj, iso, genome, args)
-    summary = write_outputs(winners, dropped, relations, models, sj, iso, genome, args)
+    summary = write_outputs(winners, dropped, relations, models, sj, iso, genome, args,
+                            bam_stats=bam_stats, protein_evidence=protein_evidence)
     write_run_manifest(args, argv, started, summary, bam_stats)
     print(json.dumps(summary, ensure_ascii=False), flush=True)
     print(f"输出目录：{args.outdir}", flush=True)

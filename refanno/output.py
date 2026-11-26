@@ -143,7 +143,71 @@ def format_family_donors(donors):
     return ";".join(f"{donor['donor']}:{donor['evidence']}" for donor in donors)
 
 
-def write_review_qc(outdir, winners, models, records, relations, genome, args):
+def _h(value):
+    return html.escape(str(value))
+
+
+def _bar(value, total, color="#4c78a8"):
+    pct = 100.0 * value / total if total else 0.0
+    return (f'<td class="num">{value:,}</td>'
+            f'<td class="barcell"><div class="track"><div class="fill" '
+            f'style="width:{pct:.1f}%;background:{color}"></div></div><span>{pct:.1f}%</span></td>')
+
+
+def _dist_table(counts, total=None, order=None, color="#4c78a8", label="Category"):
+    total = sum(counts.values()) if total is None else total
+    keys = [k for k in order if counts.get(k)] if order else sorted(counts, key=lambda k: (-counts[k], str(k)))
+    keys += [k for k in sorted(counts) if k not in keys]
+    rows = "".join(f"<tr><th>{_h(key)}</th>{_bar(counts[key], total, color)}</tr>" for key in keys if counts.get(key))
+    return f'<table><tr><th>{_h(label)}</th><th>Count</th><th>Share</th></tr>{rows}</table>'
+
+
+def _table(headers, rows, limit=None, note=""):
+    shown = rows[:limit] if limit else rows
+    body = "".join("<tr>" + "".join(f"<td>{cell}</td>" for cell in row) + "</tr>" for row in shown)
+    head = "".join(f"<th>{_h(h)}</th>" for h in headers)
+    suffix = f'<p class="dim">仅列出前 {len(shown):,} 行（共 {len(rows):,} 行），全量见 {_h(note)}。</p>' if limit and len(rows) > limit else ""
+    return f"<table><tr>{head}</tr>{body}</table>{suffix}"
+
+
+EVIDENCE_ORDER = ["isoseq_exact", "short_read_complete", "short_read_partial",
+                  "homology_only", "family_indirect", "annotation_only"]
+STATUS_ORDER = ["exact_isoseq", "supported", "partial", "unsupported", "untested"]
+
+
+def _winner_junction_stats(winners, records, sj, iso, genome, args):
+    totals = {"junctions": 0, "sr_supported": 0, "iso_supported": 0,
+              "unsupported": 0, "noncanonical": 0}
+    weak = []
+    for winner in winners:
+        model = winner["model"]
+        for intron in model.cds_introns:
+            unique, multi = sj.get(model, intron)
+            molecules = iso.junction_support(model, intron)
+            supported = unique >= args.min_sj or molecules >= args.min_isoform_molecules
+            motif = genome.splice_strand(model.chrom, [intron])
+            totals["junctions"] += 1
+            totals["sr_supported"] += unique >= args.min_sj
+            totals["iso_supported"] += molecules >= args.min_isoform_molecules
+            totals["unsupported"] += not supported
+            totals["noncanonical"] += motif not in {"+", "-"}
+            if not supported and (unique or multi or molecules):
+                weak.append((unique + multi, records[model.key]["gene_id"], model.source_model,
+                             model.chrom, intron[0], intron[1], model.strand,
+                             unique, multi, molecules, motif or "."))
+    weak.sort(reverse=True)
+    return totals, weak
+
+
+def _bin(value, edges):
+    for label, low, high in edges:
+        if low <= value < high:
+            return label
+    return edges[-1][0]
+
+
+def write_review_qc(outdir, winners, models, records, relations, genome, args,
+                    sj=None, iso=None, bam_stats=None, protein_evidence=None, duplicate_info=None):
     review_winners = [winner for winner in winners
                       if winner["model"].review
                       or winner["model"].structure_status in {"partial", "unsupported", "untested"}
@@ -210,33 +274,291 @@ def write_review_qc(outdir, winners, models, records, relations, genome, args):
                 "dropped": fates[(set_name, "dropped")],
             })
 
+    primary_models = [winner["model"] for winner in winners]
+    total_genes = len(winners)
     evidence_counts = Counter(winner["evidence_class"] for winner in winners)
     status_counts = Counter(winner["model"].structure_status for winner in winners)
-    rows = [
-        ("Primary genes", len(winners)),
+    reason_counts = Counter(winner["reason"] for winner in winners)
+    selection_counts = Counter(winner["selection"] for winner in winners)
+
+    sections = []
+
+    set_counts = Counter(model.set_name for model in models)
+    overview_rows = [
+        ("RefAnno version", __version__),
+        ("Output schema", OUTPUT_SCHEMA_VERSION),
+        ("Input sets", "; ".join(f"{name} ({count:,} transcripts)" for name, count in sorted(set_counts.items()))),
+        ("Input transcripts", len(models)),
+        ("Primary genes", total_genes),
         ("Transcripts", sum(1 + len(winner["alternatives"]) for winner in winners)),
-        ("Structural changes", len(changes)),
+        ("Structural changes (UTR consensus)", len(changes)),
         ("Genes requiring review", len(review_winners)),
-        ("Evidence classes", ", ".join(f"{key}={value}" for key, value in sorted(evidence_counts.items()))),
-        ("Structure status", ", ".join(f"{key}={value}" for key, value in sorted(status_counts.items()))),
+        ("Key thresholds", f"min_sj={args.min_sj}; min_isoform_molecules={args.min_isoform_molecules}; "
+                           f"max_isoforms={args.max_isoforms}; min_cds_coverage={args.min_cds_coverage}"),
     ]
+    if bam_stats:
+        overview_rows.append(("RNA-seq BAMs", "; ".join(os.path.basename(s["path"]) for s in bam_stats)))
+    if iso is not None and len(iso):
+        overview_rows.append(("Iso-seq chains", f"{len(iso):,}"))
+    if protein_evidence is not None and len(protein_evidence):
+        overview_rows.append(("Protein hits", f"{len(protein_evidence):,}"))
+    overview = "".join(
+        f"<tr><th>{_h(k)}</th><td class='num'>{v:,}</td></tr>" if isinstance(v, int)
+        else f"<tr><th>{_h(k)}</th><td>{_h(v)}</td></tr>" for k, v in overview_rows)
+    sections.append(f"<h2>1. 运行概览</h2><table>{overview}</table>")
+
+    cross = {}
+    for winner in winners:
+        model = winner["model"]
+        bucket = cross.setdefault(winner["evidence_class"], [0, 0])
+        bucket[0] += 1
+        bucket[1] += len(model.cds) == 1
+    cross_rows = []
+    for key in [k for k in EVIDENCE_ORDER if k in cross] + sorted(set(cross) - set(EVIDENCE_ORDER)):
+        total, single = cross[key]
+        pct = f"{100.0 * single / total:.1f}%" if total else "0"
+        cross_rows.append((f"<b>{_h(key)}</b>", f"{total:,}", f"{single:,}", pct))
+    sections.append(
+        "<h2>2. 证据链</h2>"
+        "<h3>2.1 证据等级分布</h3>" + _dist_table(evidence_counts, order=EVIDENCE_ORDER, label="Evidence class") +
+        "<h3>2.2 保留原因</h3>" + _dist_table(reason_counts, label="Reason") +
+        "<h3>2.3 主代表选择依据</h3>" + _dist_table(selection_counts, label="Selection") +
+        "<h3>2.4 结构状态</h3>" + _dist_table(status_counts, order=STATUS_ORDER, label="Structure status") +
+        "<h3>2.5 证据等级 × 单外显子基因</h3>"
+        '<p class="dim">单外显子比例高的证据等级（尤其 homology_only）通常意味着假阳性风险。</p>'
+        + _table(["Evidence class", "Genes", "Single-exon", "Single-exon %"], cross_rows))
+
     fate_rows = []
-    for set_name in sorted({model.set_name for model in models}):
-        fate_rows.append((set_name, fates[(set_name, "primary")], fates[(set_name, "alternative")],
-                          fates[(set_name, "dropped")]))
-    overview = "".join(f"<tr><th>{html.escape(str(key))}</th><td>{html.escape(str(value))}</td></tr>" for key, value in rows)
-    fate_html = "".join("<tr>" + "".join(f"<td>{html.escape(str(value))}</td>" for value in row) + "</tr>"
-                        for row in fate_rows)
+    for set_name in sorted(set_counts):
+        members = [model for model in models if model.set_name == set_name]
+        kept = fates[(set_name, "primary")] + fates[(set_name, "alternative")]
+        fate_rows.append(
+            f"<tr><th>{_h(set_name)}</th><td class='num'>{len(members):,}</td>"
+            f"<td class='num'>{sum(m.complete_cds for m in members):,}</td>"
+            f"<td class='num'>{sum(m.structure_status in {'exact_isoseq', 'supported'} for m in members):,}</td>"
+            f"<td class='num'>{sum(m.structure_status == 'partial' for m in members):,}</td>"
+            f"<td class='num'>{fates[(set_name, 'primary')]:,}</td>"
+            f"<td class='num'>{fates[(set_name, 'alternative')]:,}</td>"
+            f"<td class='num'>{fates[(set_name, 'dropped')]:,}</td>"
+            + _bar(kept, len(members), "#59a14f") + "</tr>")
+    sections.append(
+        "<h2>3. 输入集合命运</h2><table><tr><th>Set</th><th>Transcripts</th><th>Complete CDS</th>"
+        "<th>Structure supported</th><th>Partial</th><th>Primary</th><th>Alternative</th><th>Dropped</th>"
+        "<th>Retention</th><th></th></tr>" + "".join(fate_rows) + "</table>")
+
+    exon_edges = [("1", 1, 2), ("2", 2, 3), ("3–5", 3, 6), ("6–10", 6, 11), ("11–20", 11, 21), (">20", 21, 1 << 62)]
+    cds_edges = [("<300", 0, 300), ("300–600", 300, 600), ("600–1200", 600, 1200),
+                 ("1200–2400", 1200, 2400), ("2400–6000", 2400, 6000), (">6000", 6000, 1 << 62)]
+    exon_bins = Counter(_bin(len(m.exons), exon_edges) for m in primary_models)
+    cds_bins = Counter(_bin(m.cds_len, cds_edges) for m in primary_models)
+    consensus3 = reason_counts.get("3set_chain_consensus", 0)
+    consensus2 = reason_counts.get("2set_chain_consensus", 0)
+    struct_rows = [
+        ("Complete CDS", sum(m.complete_cds for m in primary_models)),
+        ("Internal stop codon", sum("internal_stop" in m.review for m in primary_models)),
+        ("Single-exon genes", sum(len(m.cds) == 1 for m in primary_models)),
+        ("Mean exons per gene", f"{sum(len(m.exons) for m in primary_models) / total_genes:.2f}" if total_genes else 0),
+        ("3-set chain consensus", consensus3),
+        ("2-set chain consensus", consensus2),
+        ("Multi-isoform loci", sum(bool(winner["alternatives"]) for winner in winners)),
+    ]
+    struct_overview = "".join(f"<tr><th>{_h(k)}</th><td class='num'>{_h(v)}</td></tr>" for k, v in struct_rows)
+    sections.append(
+        "<h2>4. 最终基因集结构</h2><table>" + struct_overview + "</table>"
+        "<h3>4.1 外显子数分布</h3>" + _dist_table(exon_bins, order=[e[0] for e in exon_edges], label="Exons") +
+        "<h3>4.2 CDS 长度分布 (bp)</h3>" + _dist_table(cds_bins, order=[e[0] for e in cds_edges], label="CDS length"))
+
+    rna_sections = []
+    if bam_stats:
+        bam_rows = []
+        for stat in bam_stats:
+            pct = 100.0 * stat["spliced_reads"] / stat["mapq_pass"] if stat["mapq_pass"] else 0.0
+            warn = " class='warn'" if stat["reads"] >= 10000 and pct < 1 else ""
+            bam_rows.append((f"<b>{_h(os.path.basename(stat['path']))}</b>", f"{stat['reads']:,}",
+                             f"{stat['mapq_pass']:,}", f"{stat['spliced_reads']:,}",
+                             f"<span{warn}>{pct:.1f}%</span>"))
+        rna_sections.append(
+            "<h3>5.1 逐 BAM 比对统计</h3>"
+            '<p class="dim">剪接读段占比 &lt;1% 的 BAM 会被标黄：它可能不是链特异性 RNA-seq（例如 Hi-C），对 junction 证据贡献有限。</p>'
+            + _table(["BAM", "Reads", "MAPQ pass", "Spliced reads", "Spliced %"], bam_rows))
+    if sj is not None and iso is not None:
+        totals, weak = _winner_junction_stats(winners, records, sj, iso, genome, args)
+        junction_rows = [
+            ("CDS junctions (primary transcripts)", totals["junctions"]),
+            (f"Supported by short reads (unique ≥ {args.min_sj})", totals["sr_supported"]),
+            (f"Supported by Iso-seq (molecules ≥ {args.min_isoform_molecules})", totals["iso_supported"]),
+            ("Unsupported", totals["unsupported"]),
+            ("Non-canonical splice motif", totals["noncanonical"]),
+        ]
+        junction_overview = "".join(f"<tr><th>{_h(k)}</th><td class='num'>{v:,}</td></tr>" for k, v in junction_rows)
+        weak_rows = [(f"<b>{_h(gid)}</b>", _h(src), _h(chrom), f"{start:,}–{end:,}", _h(strand),
+                      f"{u:,}", f"{m:,}", f"{mol:,}", _h(motif))
+                     for _, gid, src, chrom, start, end, strand, u, m, mol, motif in weak]
+        rna_sections.append(
+            "<h3>5.2 主代表 junction 支持</h3><table>" + junction_overview + "</table>"
+            "<h3>5.3 弱支持 junction（Top 30）</h3>"
+            + _table(["Gene", "Source model", "Chrom", "Intron", "Strand", "Unique", "Multi", "Iso-seq", "Motif"],
+                     weak_rows, limit=30, note="junction_evidence.tsv"))
+    if args.bam:
+        depth_edges = [("0", -1e-9, 1e-9), ("(0, 1)", 1e-9, 1), ("1–10", 1, 10), ("≥10", 10, float("inf"))]
+        cov_edges = [("≥0.9", 0.9, 2.0), ("0.5–0.9", 0.5, 0.9), ("<0.5", -1e-9, 0.5)]
+        depth_bins = Counter(_bin(m.depth, depth_edges) for m in primary_models)
+        cov_bins = Counter(_bin(m.coverage, cov_edges) for m in primary_models)
+        rna_sections.append(
+            "<h3>5.4 主代表 CDS 深度与覆盖度</h3><div class='cols'><div><h4>Depth</h4>"
+            + _dist_table(depth_bins, order=[e[0] for e in depth_edges], label="Depth")
+            + "</div><div><h4>Coverage</h4>"
+            + _dist_table(cov_bins, order=[e[0] for e in cov_edges], label="Coverage") + "</div></div>")
+    if rna_sections:
+        sections.append("<h2>5. RNA 证据</h2>" + "".join(rna_sections))
+
+    if iso is not None and len(iso):
+        utr_applied = sum(bool(winner["model"].utr_note) for winner in winners)
+        utr_changed = sum(bool(winner.get("utr_changed")) for winner in winners)
+        utr_flags = Counter(flag for m in primary_models for flag in m.review if flag.startswith("utr_"))
+        deltas = []
+        for winner in winners:
+            change = winner.get("change")
+            if change and change.get("type") == "utr_consensus":
+                old_len = sum(e - s + 1 for s, e in change["old_exons"])
+                new_len = sum(e - s + 1 for s, e in change["new_exons"])
+                deltas.append(new_len - old_len)
+        delta_edges = [("≤-500", -1 << 60, -500), ("-500–-100", -500, -100), ("-100–100", -100, 100),
+                       ("100–500", 100, 500), ("≥500", 500, 1 << 60)]
+        delta_bins = Counter(_bin(d, delta_edges) for d in deltas)
+        alt_total = sum(len(winner["alternatives"]) for winner in winners)
+        iso_rows = [
+            ("Iso-seq chains", len(iso)),
+            ("Genes with exact Iso-seq support", evidence_counts.get("isoseq_exact", 0)),
+            ("Alternative transcripts retained", alt_total),
+            ("Multi-isoform loci", sum(bool(winner["alternatives"]) for winner in winners)),
+            ("UTR consensus applied", utr_applied),
+            ("UTR consensus changed exons", utr_changed),
+            ("UTR consensus ambiguous", utr_flags.get("utr_consensus_ambiguous", 0)),
+            ("UTR consensus incomplete", utr_flags.get("utr_consensus_incomplete", 0)),
+        ]
+        iso_html = "<table>" + "".join(f"<tr><th>{_h(k)}</th><td class='num'>{_h(v)}</td></tr>"
+                                       for k, v in iso_rows) + "</table>"
+        if deltas:
+            mean_delta = sum(deltas) / len(deltas)
+            iso_html += (f"<h3>6.1 UTR 修订长度变化（n={len(deltas):,}，均值 {mean_delta:+.0f} bp）</h3>"
+                         + _dist_table(delta_bins, order=[e[0] for e in delta_edges], label="Δ exon length (bp)"))
+        sections.append("<h2>6. Iso-seq 证据</h2>" + iso_html)
+
+    if protein_evidence is not None and len(protein_evidence):
+        hits = [hit for values in protein_evidence.by_chrom.values() for hit in values]
+        id_edges = [("<0.5", -1e-9, 0.5), ("0.5–0.8", 0.5, 0.8), ("0.8–0.95", 0.8, 0.95),
+                    ("0.95–<1.0", 0.95, 0.999), ("=1.0", 0.999, 2.0)]
+        id_bins = Counter(_bin(hit.identity, id_edges) for hit in hits)
+        identical = id_bins.get("=1.0", 0)
+        warning = ""
+        if len(hits) >= 1000 and identical >= 0.3 * len(hits):
+            warning = (f"<p class='warnbox'>警告：{100.0 * identical / len(hits):.0f}% 的蛋白命中一致性为 1.0，"
+                       "--proteins 很可能来自同一基因组自身的预测，蛋白支持退化为自我确认；"
+                       "建议改用近缘物种或 Swiss-Prot 等独立来源。</p>")
+        protein_only = [m for m in primary_models if records[m.key]["reason"] == "unique_with_protein"]
+        risky = sum(len(m.cds) == 1 and m.depth == 0 for m in protein_only)
+        protein_rows = [
+            ("Protein hits", len(hits)),
+            ("Genes with protein support", sum(m.protein_coverage > 0 for m in primary_models)),
+            ("Protein-only retained genes", len(protein_only)),
+            ("Protein-only + single-exon + zero depth (high risk)", risky),
+        ]
+        sections.append(
+            "<h2>7. 蛋白同源证据</h2>" + warning
+            + "<table>" + "".join(f"<tr><th>{_h(k)}</th><td class='num'>{v:,}</td></tr>"
+                                  for k, v in protein_rows) + "</table>"
+            + "<h3>7.1 命中一致性分布</h3>"
+            + _dist_table(id_bins, order=[e[0] for e in id_edges], label="Identity"))
+
+    if duplicate_info is None:
+        duplicate_info = detect_duplicate_clusters(primary_models, args)
+    tandem_clusters = len({d["cluster"] for d in duplicate_info.values() if d["type"] == "tandem"})
+    tandem_genes = sum(d["type"] == "tandem" for d in duplicate_info.values())
+    dup_clusters = len({d["cluster"] for d in duplicate_info.values() if d["type"] == "duplicate"})
+    dup_genes = sum(d["type"] == "duplicate" for d in duplicate_info.values())
+    rescues = []
+    for winner in winners:
+        model = winner["model"]
+        for donor in model.family_donors:
+            donor_record = records.get(donor["donor"], {})
+            rescues.append((f"<b>{_h(records[model.key]['gene_id'])}</b>", _h(model.source_model),
+                            _h(model.family_cluster), _h(donor_record.get("gene_id", "")),
+                            _h(donor["evidence"]), _h(donor["protein_target"]),
+                            f"{donor['value']:.3f}" if isinstance(donor["value"], float) else _h(donor["value"])))
+    dup_rows = [("Tandem clusters", tandem_clusters), ("Tandem genes", tandem_genes),
+                ("Duplicate clusters", dup_clusters), ("Duplicate genes", dup_genes),
+                ("Family-rescued genes", sum(winner["reason"] == "tandem_family_support" for winner in winners))]
+    dup_html = "<table>" + "".join(f"<tr><th>{_h(k)}</th><td class='num'>{v:,}</td></tr>" for k, v in dup_rows) + "</table>"
+    if rescues:
+        dup_html += ("<h3>8.1 家族救援明细</h3>"
+                     + _table(["Rescued gene", "Source model", "Cluster", "Donor gene", "Evidence", "Protein", "Value"],
+                              rescues, limit=100, note="family_rescues.tsv"))
+    sections.append("<h2>8. 重复与基因家族</h2>" + dup_html)
+
+    flag_counts = Counter(flag for m in primary_models for flag in set(m.review))
+    flag_html = _dist_table(flag_counts, label="Review flag") if flag_counts else "<p class='dim'>无 review 标记。</p>"
+    risk_rows = []
+    for winner in winners:
+        model = winner["model"]
+        score = 0
+        if "internal_stop" in model.review:
+            score += 4
+        if records[model.key]["reason"] == "unique_with_protein" and len(model.cds) == 1 and model.depth == 0:
+            score += 3
+        if winner["evidence_class"] == "family_indirect":
+            score += 2
+        if model.junctions_total and model.junctions_supported < model.junctions_total:
+            score += 2
+        if any(flag.startswith("utr_") for flag in model.review):
+            score += 1
+        if model.structure_status in {"partial", "unsupported", "untested"}:
+            score += 1
+        if not score:
+            continue
+        risk_rows.append((score, model, winner))
+    risk_rows.sort(key=lambda item: (-item[0], natural_key(item[1].chrom), item[1].cds[0][0]))
+    risk_table = []
+    for score, model, winner in risk_rows[:50]:
+        risk_table.append((
+            str(score), f"<b>{_h(records[model.key]['gene_id'])}</b>", _h(model.source_model),
+            _h(winner["evidence_class"]), _h(records[model.key]["reason"]),
+            _h(",".join(sorted(set(model.review)))), str(len(model.exons)),
+            f"{model.depth:.1f}", f"{model.coverage:.2f}",
+            f"{model.junctions_supported}/{model.junctions_total}",
+            f"{model.protein_identity:.2f}", f"{model.protein_coverage:.2f}"))
+    sections.append(
+        "<h2>9. 复查优先级</h2><h3>9.1 Review 标记计数</h3>" + flag_html
+        + "<h3>9.2 高风险基因（Top 50）</h3>"
+        + '<p class="dim">风险分：internal_stop +4；仅蛋白+单外显子+零深度 +3；family_indirect +2；'
+          '存在不支持 junction +2；UTR 歧义/不完整 +1；结构 partial/untested +1。全量见 decision_report.tsv 的 review 列。</p>'
+        + _table(["Score", "Gene", "Source model", "Evidence class", "Reason", "Flags", "Exons",
+                  "Depth", "Coverage", "Junctions", "Protein id", "Protein cov"], risk_table, limit=50))
+
     document = f"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>RefAnno QC report</title>
-<style>body{{font-family:sans-serif;max-width:1100px;margin:2rem auto;color:#222}}
-table{{border-collapse:collapse;margin:1rem 0;min-width:45%}}th,td{{border:1px solid #ccc;padding:.45rem;text-align:left}}
-th{{background:#eef3f8}}.note{{padding:1rem;background:#fff8dc}}</style></head><body>
+<html lang="zh"><head><meta charset="utf-8"><title>RefAnno QC report</title>
+<style>
+body{{font-family:-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;max-width:1150px;margin:2rem auto;padding:0 1rem;color:#222;line-height:1.45}}
+h1{{border-bottom:3px solid #4c78a8;padding-bottom:.3rem}}
+h2{{margin-top:2.2rem;border-bottom:1px solid #ddd;padding-bottom:.2rem;color:#1a3a5c}}
+h3{{margin-top:1.4rem;color:#333}}h4{{margin:.5rem 0}}
+table{{border-collapse:collapse;margin:.8rem 0;min-width:45%}}
+th,td{{border:1px solid #ccc;padding:.4rem .6rem;text-align:left;vertical-align:middle}}
+th{{background:#eef3f8}}td.num{{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}}
+.note{{padding:.8rem 1rem;background:#fff8dc;border-left:4px solid #e6c229}}
+.warnbox{{padding:.8rem 1rem;background:#fdecea;border-left:4px solid #d64545}}
+.warn{{background:#ffe08a;padding:.1rem .3rem}}
+.dim{{color:#666;font-size:.92em}}
+.track{{display:inline-block;width:220px;height:.8em;background:#eee;border-radius:3px;vertical-align:middle;margin-right:.5rem}}
+.fill{{height:100%;border-radius:3px}}
+.cols{{display:flex;gap:2.5rem;flex-wrap:wrap}}
+</style></head><body>
 <h1>RefAnno QC report</h1>
-<p class="note">These metrics describe evidence and model fates. Increased gene counts or BUSCO completeness alone do not demonstrate structural accuracy.</p>
-<h2>Run overview</h2><table>{overview}</table>
-<h2>Input model fates</h2><table><tr><th>Set</th><th>Primary</th><th>Alternative</th><th>Dropped</th></tr>{fate_html}</table>
-<p>Detailed evidence: decision_report.tsv, decision_events.tsv, junction_evidence.tsv, changes.tsv and run_manifest.json.</p>
+<p class="note">这些指标描述证据链与输入模型命运。基因数增加或 BUSCO 完整度本身并不能证明结构准确性；
+请优先关注第 2、7、9 节中的风险信号。</p>
+{''.join(sections)}
+<p class="dim">详细证据：decision_report.tsv · decision_events.tsv · junction_evidence.tsv · changes.tsv ·
+family_rescues.tsv · input_fates.tsv · run_manifest.json</p>
 </body></html>
 """
     with open(os.path.join(outdir, "qc_report.html"), "w") as out:
@@ -244,7 +566,8 @@ th{{background:#eef3f8}}.note{{padding:1rem;background:#fff8dc}}</style></head><
     return {"review_genes": len(review_winners), "structural_changes": len(changes)}
 
 
-def write_outputs(winners, dropped, relations, models, sj, iso, genome, args):
+def write_outputs(winners, dropped, relations, models, sj, iso, genome, args,
+                  bam_stats=None, protein_evidence=None):
     winners.sort(key=lambda w: (natural_key(w["model"].chrom), w["model"].cds[0][0],
                                 w["model"].cds[-1][1], w["model"].strand, w["model"].key))
     duplicate_info = detect_duplicate_clusters([w["model"] for w in winners], args)
@@ -392,7 +715,9 @@ def write_outputs(winners, dropped, relations, models, sj, iso, genome, args):
                 out.write(model_row(model, "CDS", start, end, [("ID", f"{txid}.CDS.{i}"), ("Parent", txid)]) + "\n")
 
     write_decision_evidence(args.outdir, models, records, relations, sj, iso, genome, args)
-    qc = write_review_qc(args.outdir, winners, models, records, relations, genome, args)
+    qc = write_review_qc(args.outdir, winners, models, records, relations, genome, args,
+                         sj=sj, iso=iso, bam_stats=bam_stats, protein_evidence=protein_evidence,
+                         duplicate_info=duplicate_info)
 
     summary = {
         "refanno_version": __version__, "output_schema_version": OUTPUT_SCHEMA_VERSION,
