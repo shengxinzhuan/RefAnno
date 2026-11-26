@@ -98,7 +98,7 @@ def run(argv=None):
     for path in args.sj:
         sj.load(path)
     depth = DepthIndex(args.bam, models)
-    load_bam_junctions(args.bam, genome, sj, depth)
+    bam_stats = load_bam_junctions(args.bam, genome, sj, depth)
     chains = []
     for path in args.isoseq:
         if path.lower().endswith((".bam", ".cram")):
@@ -128,7 +128,7 @@ def run(argv=None):
     if args.max_isoforms > 1 and len(iso):
         attach_isoforms(winners, sj, iso, genome, args)
     summary = write_outputs(winners, dropped, relations, models, sj, iso, genome, args)
-    write_run_manifest(args, argv, started, summary)
+    write_run_manifest(args, argv, started, summary, bam_stats)
     print(json.dumps(summary, ensure_ascii=False), flush=True)
     print(f"输出目录：{args.outdir}", flush=True)
     return summary

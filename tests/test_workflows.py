@@ -1,4 +1,6 @@
+import contextlib
 import csv
+import io
 import json
 import os
 import shutil
@@ -64,6 +66,12 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(manifest["output_schema_version"], "1.1")
         self.assertTrue(manifest["inputs"])
         self.assertTrue(all(len(record["sha256"]) == 64 for record in manifest["inputs"]))
+        for record in manifest["inputs"]:
+            if record["role"] == "short_read_bam":
+                self.assertIn("reads", record)
+                self.assertIn("mapq_pass_reads", record)
+                self.assertIn("spliced_reads", record)
+                self.assertGreaterEqual(record["mapq_pass_reads"], record["spliced_reads"])
         output_names = {record["path"] for record in manifest["outputs"]}
         self.assertIn("final.gff3", output_names)
         self.assertIn("decision_events.tsv", output_names)
@@ -247,11 +255,21 @@ class WorkflowTests(unittest.TestCase):
         bam = str(self.root / "rna.bam")
         depth = DepthIndex([bam], [both, shared, tail])
         sj = SJIndex()
-        load_bam_junctions([bam], Genome(str(self.root / "genome.fa")), sj, depth)
+        stats = load_bam_junctions([bam], Genome(str(self.root / "genome.fa")), sj, depth)
+        self.assertEqual(stats, [{"path": bam, "reads": 3, "mapq_pass": 3, "spliced_reads": 1}])
         self.assertEqual(depth.get(both), (0.75, 0.75, 0.5, 0.5))
         self.assertEqual(depth.get(shared), (1.0, 1.0, 0.5, 0.5))
         self.assertEqual(depth.get(tail), (0.1, 0.1, 0.0, 0.0))
         self.assertEqual(dict(sj.data["chr1"]), {(351, 450, "."): [1, 0]})
+
+        flat = str(self.root / "hic.bam")
+        write_bam(flat, [make_read(f"f{i}", 1 + i % 1800, [(0, 100)]) for i in range(10000)], 2000)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            flat_stats = load_bam_junctions([flat], Genome(str(self.root / "genome.fa")), SJIndex())
+        self.assertEqual(flat_stats[0]["reads"], 10000)
+        self.assertEqual(flat_stats[0]["spliced_reads"], 0)
+        self.assertIn("可能不是 RNA-seq", stderr.getvalue())
 
     def test_version(self):
         result = self.run_command([sys.executable, str(self.script), "--version"])

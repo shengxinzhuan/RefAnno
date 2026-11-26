@@ -215,6 +215,8 @@ duplicate_size=3
 
 RefAnno 对每个二代 BAM 顺序扫描一遍，在同一趟里提取 junction 并按 CDS 块累计深度，不按基因做随机查询，因此在大基因组和深度较高的 BAM 上耗时与 BAM 总大小成正比，而不随模型数量倍增。整链 CDS 平均深度只计一次，避免多内含子模型重复获得深度奖励。深度用于代表选择，不与蛋白支持混合成一个保留总分。unique/multi 深度和 junction 分开统计，多重比对证据不会伪装成某个拷贝的精确支持。
 
+**`--bam` 只应提供 RNA-seq 比对。** Hi-C、ATAC、基因组重测序等数据的覆盖度不是表达信号，却会被当作 CDS 深度参与裁决，使单外显子模型被误判为有 RNA 支持。RefAnno 在扫描时统计每个 BAM 的比对数和含剪接 reads 数并写入 `run_manifest.json`；若一个 BAM 的剪接 reads 比例低于 1%，会在运行时给出警告。
+
 ## 可选 Iso-seq 增强
 
 提供 `--isoseq` 后，完整长读链独立参与结构和代表裁决。
@@ -363,7 +365,7 @@ python -m unittest discover -v
 | `input_fates.tsv` | 每套输入的模型数、完整 CDS 数、结构支持数和最终去向 |
 | `qc_report.html` | 离线 QC 报告，汇总证据等级、复查项和结构变更 |
 | `summary.json` | 软件与输出格式版本，以及基因、转录本、结构状态、修订和证据等级统计 |
-| `run_manifest.json` | 命令、参数、运行环境版本、起止时间、输入输出文件大小与 SHA256 |
+| `run_manifest.json` | 命令、参数、运行环境版本、起止时间、输入输出文件大小与 SHA256；每个 BAM 另记录比对数、MAPQ 通过数和含剪接 reads 数 |
 | `miniprot.cache.json` | 蛋白比对缓存指纹，输入或参数改变时自动失效 |
 
 `decision_report.tsv` 不再提供混合 `score`。主要字段包括：

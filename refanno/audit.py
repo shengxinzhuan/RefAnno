@@ -62,8 +62,9 @@ def bam_index(path):
     return next((candidate for candidate in candidates if os.path.isfile(candidate)), "")
 
 
-def input_records(args):
+def input_records(args, bam_stats=()):
     records = []
+    scanned = {item["path"]: item for item in bam_stats}
 
     def add(role, path, name=""):
         record = {
@@ -74,6 +75,11 @@ def input_records(args):
             index = bam_index(path)
             record["index_path"] = os.path.abspath(index) if index else ""
             record["index_sha256"] = file_sha256(index) if index else ""
+            stats = scanned.get(record["path"])
+            if stats:
+                record["reads"] = stats["reads"]
+                record["mapq_pass_reads"] = stats["mapq_pass"]
+                record["spliced_reads"] = stats["spliced_reads"]
         records.append(record)
 
     for spec in args.set:
@@ -93,7 +99,7 @@ def input_records(args):
     return records
 
 
-def write_run_manifest(args, argv, started, summary):
+def write_run_manifest(args, argv, started, summary, bam_stats=()):
     command = [sys.argv[0]] + sys.argv[1:] if argv is None else ["refanno"] + list(argv)
     ended = datetime.now(timezone.utc)
     dependencies = {"python": platform.python_version(), "pysam": package_version("pysam")}
@@ -110,7 +116,7 @@ def write_run_manifest(args, argv, started, summary):
         "status": "completed", "command": command, "parameters": vars(args),
         "started_utc": started.isoformat(), "ended_utc": ended.isoformat(),
         "duration_seconds": (ended - started).total_seconds(),
-        "dependencies": dependencies, "inputs": input_records(args), "outputs": outputs,
+        "dependencies": dependencies, "inputs": input_records(args, bam_stats), "outputs": outputs,
         "summary": summary,
     }
     write_json(os.path.join(args.outdir, "run_manifest.json"), manifest)

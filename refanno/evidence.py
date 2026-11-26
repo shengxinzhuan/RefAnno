@@ -2,6 +2,7 @@ import bisect
 import os
 import re
 import subprocess
+import sys
 from collections import Counter, defaultdict
 
 from .audit import executable_version, file_sha256, read_json, write_json
@@ -134,26 +135,32 @@ class SJIndex:
 
 
 def load_bam_junctions(paths, genome, sj, depth=None, min_mapq=10, min_anchor=8):
+    stats = []
     if not paths:
-        return
+        return stats
     try:
         import pysam
     except ImportError as exc:
         raise RuntimeError("读取 BAM 需要 pysam：conda install -c bioconda pysam") from exc
     for path in paths:
+        counts = {"path": os.path.abspath(path), "reads": 0, "mapq_pass": 0, "spliced_reads": 0}
+        stats.append(counts)
         with pysam.AlignmentFile(path, "rb") as bam:
             if depth is not None and not set(bam.references) & set(depth.by_chrom):
                 raise RuntimeError(f"{path} 与注释没有共同的序列名，请检查 seqid 是否一致")
             for read in bam.fetch(until_eof=True):
                 if read.is_unmapped or read.is_secondary or read.is_supplementary:
                     continue
+                counts["reads"] += 1
                 if depth is not None:
                     depth.consume(read)
                 if read.mapping_quality < min_mapq:
                     continue
+                counts["mapq_pass"] += 1
                 cigar = read.cigartuples
                 if not any(op == 3 for op, _ in (cigar or ())):
                     continue
+                counts["spliced_reads"] += 1
                 xs = read.get_tag("XS") if read.has_tag("XS") else "."
                 multi = read.get_tag("NH") > 1 if read.has_tag("NH") else False
                 ref = read.reference_start + 1
@@ -176,8 +183,14 @@ def load_bam_junctions(paths, genome, sj, depth=None, min_mapq=10, min_anchor=8)
                         pending = ((ref, ref + length - 1), anchor) if anchor >= min_anchor and 5 <= length <= 200000 else None
                         ref += length
                         anchor = 0
+        if counts["reads"] >= 10000 and counts["spliced_reads"] < 0.01 * counts["mapq_pass"]:
+            print(f"警告: {path} 的 {counts['mapq_pass']} 条比对中仅 {counts['spliced_reads']} 条含剪接"
+                  f"（{100 * counts['spliced_reads'] / max(counts['mapq_pass'], 1):.2f}%），可能不是 RNA-seq"
+                  "（Hi-C/ATAC/基因组测序？）；其覆盖度会按 RNA 深度参与裁决，请确认是否应作为 --bam 输入",
+                  file=sys.stderr, flush=True)
     if depth is not None:
         depth.finalize()
+    return stats
 
 
 class ProteinIndex:
