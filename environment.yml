@@ -4,5 +4,6 @@ channels:
   - bioconda
 dependencies:
   - python=3.11
+  - pip
   - pysam>=0.22
   - miniprot>=0.13

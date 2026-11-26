@@ -24,14 +24,16 @@ RefAnno 评估和修订输入模型，不从零创建新基因。局部共识目
 ```bash
 conda env create -f environment.yml
 conda activate refanno
+python -m pip install --no-deps .
+refanno --version
 ```
 
-环境包含 Python、`pysam` 和 `miniprot`，不需要额外安装 Python 包。
+环境包含 Python、`pysam` 和 `miniprot`。最后一步安装 RefAnno 包和 `refanno` 命令，`--no-deps` 避免 pip 重复安装 conda 已管理的依赖。
 
 ## 快速开始
 
 ```bash
-python3 RefAnno.py \
+refanno \
   --set setA=A.gff3 \
   --set setB=B.gff3 \
   --set setC=C.gff3 \
@@ -42,7 +44,7 @@ python3 RefAnno.py \
   --outdir RefAnno_out
 ```
 
-`--set` 和 `--bam` 都可以重复使用。多套 BAM 的证据会合并计算。
+`--set` 和 `--bam` 都可以重复使用。多套 BAM 的证据会合并计算。也可以不安装包，直接在源码目录使用 `python3 RefAnno.py` 或 `python3 -m refanno`，三者调用同一套实现。
 
 有 Iso-seq 时，在默认命令上增加：
 
@@ -314,6 +316,31 @@ samtools index -c isoseq.bam
 
 蛋白比对结果会在输出目录缓存并自动复用。输入蛋白更新后，建议使用新的输出目录重新运行。
 
+## 工程结构与测试
+
+核心代码按职责拆分：
+
+```text
+refanno/
+├── cli.py             命令行与主流程
+├── models.py          转录本、长读链和蛋白命中数据模型
+├── evidence.py        GFF/BAM/BED12、蛋白与深度证据
+├── adjudication.py    结构评估、保留和代表裁决
+├── consensus.py       UTR 共识与可变剪切
+└── output.py          GFF3、蛋白、报告和摘要输出
+```
+
+`RefAnno.py` 是源码兼容入口；安装后的 `refanno` 和 `python -m refanno` 使用同一个 `refanno.cli` 主流程。输出摘要有独立的 `output_schema_version`，报告列由端到端测试固定。
+
+开发模式安装和测试：
+
+```bash
+python -m pip install --no-deps -e .
+python -m unittest discover -v
+```
+
+测试覆盖真实合成 BAM 的深度与 junction、蛋白保留、重复家族救援、代表选择、Iso-seq 可变剪切、UTR 共识和报告格式。环境中有 miniprot 时还会运行蛋白 FASTA 自动比对集成测试；也可用 `REFANNO_MINIPROT=/path/to/miniprot` 指定可执行文件。GitHub Actions 对推送和 Pull Request 运行同一套测试。
+
 ## 输出
 
 | 文件 | 内容 |
@@ -322,7 +349,7 @@ samtools index -c isoseq.bam
 | `final.proteins.faa` | 按最终 CDS 翻译的全部转录本蛋白 |
 | `decision_report.tsv` | 结构状态、保留原因、代表依据及各类证据指标 |
 | `dropped.gff3` | 未保留模型及原因 |
-| `summary.json` | 基因、转录本、结构状态、蛋白保留和 UTR 修正统计 |
+| `summary.json` | 软件与输出格式版本，以及基因、转录本、结构状态和修订统计 |
 
 `decision_report.tsv` 不再提供混合 `score`。主要字段包括：
 
@@ -333,3 +360,7 @@ samtools index -c isoseq.bam
 - `protein_target`、`protein_identity`、`protein_coverage`、`protein_query_coverage`：同源蛋白证据；
 - `family_support`、`duplicate_type/cluster/size`：重复家族证据与标记；
 - `review`：内部终止子、家族间接保留或 UTR 共识不确定等复核标签。
+
+## 许可证
+
+RefAnno 使用 MIT License，详见 `LICENSE`。
