@@ -75,6 +75,7 @@ RefAnno 不再把蛋白、RNA、外显子数和 UTR 混入一个无法解释的�
 |---|---|
 | `exact_isoseq` | 完整 CDS 剪接链达到 Iso-seq 分子数要求 |
 | `supported` | 全部 CDS junction 已支持，或单外显子模型达到覆盖度和深度要求 |
+| `sequence_supported` | 没有 RNA 数据，但全部 CDS 内含子的供体/受体位点通过 minisplice 序列校验 |
 | `partial` | 有部分 RNA 证据，但完整结构未全部得到支持 |
 | `unsupported` | 有 RNA 数据，但该模型未得到结构支持 |
 | `untested` | 没有 RNA 数据，无法评价转录结构 |
@@ -219,8 +220,33 @@ RefAnno 对每个二代 BAM 顺序扫描一遍，在同一趟里提取 junction 
 
 **`--bam` 只应提供 RNA-seq 比对。** Hi-C、ATAC、基因组重测序等数据的覆盖度不是表达信号，却会被当作 CDS 深度参与裁决，使单外显子模型被误判为有 RNA 支持。RefAnno 在扫描时统计每个 BAM 的比对数和含剪接 reads 数并写入 `run_manifest.json`；若一个 BAM 的剪接 reads 比例低于 1%，会在运行时给出警告。
 
-## 可选 Iso-seq 增强
+## 无转录组模式：minisplice 剪接位点序列校验
 
+有些类群没有转录组数据，只能提供 GFF + 近缘蛋白。此时不带 `--bam` 运行即可（所有模型记为 `untested`），并建议接入 [minisplice](https://github.com/lh3/minisplice) 做剪接位点序列校验，它有两方面作用：
+
+1. **校验模型结构**：minisplice 用 1D-CNN 估计基因组中每个 GT/AG 位点是真实剪接位点的几率比分。RefAnno 检查每个 CDS 内含子的供体和受体分数，全部达到 `--min-splice-score`（默认 2）的多外显子模型记为 `sequence_supported`；未全部通过且缺乏直接证据的模型加 `weak_splice_sites` 复查标记。
+2. **改善远缘蛋白比对**：miniprot ≥0.16 时自动把分数文件通过 `--spsc` 传入，提高远缘同源比对的剪接位点准确性，从而改善无转录组模式下最关键的蛋白证据质量。
+
+minisplice 不在 conda 仓库，需要从源码编译后用 `--minisplice` 指定路径：
+
+```bash
+git clone https://github.com/lh3/minisplice && cd minisplice && make
+```
+
+```bash
+refanno --set A=a.gff3 --set B=b.gff3 --genome genome.fa --proteins related.faa \
+  --minisplice /path/to/minisplice --threads 16 --outdir RefAnno_out
+```
+
+模型来源有三种方式：
+
+- 不提供 `--splice-model` 时，RefAnno 用**多套输入共同支持的转录本**（同一座位内 ≥2 个集合 CDS 剪接链完全一致的链，每条链取 CDS 最长者）自动训练和校准；一致链不足 500 条时退回可信集合（`egapx`/`eviann`/`e` 加 `--trusted-set`）的每基因最长转录本，再不足则用全部输入。训练数据、模型和分数都写入输出目录并按指纹缓存。
+- 脊椎动物/昆虫基因组可以下载预训练模型（如 Zenodo 上的 `vi2-7k.kan` 及 `.cali`）后用 `--splice-model vi2-7k.kan` 指定；旁边没有 `.cali` 时会用输入注释自动校准。
+- 已有全基因组分数文件（如 Zenodo 预计算的 human/fly 文件）时用 `--splice-scores score.tsv.gz` 直接提供，跳过训练与预测。
+
+**序列校验是注释自洽性检查，不是独立证据**：ab initio 预测器本就会产生规范剪接位点，因此 `sequence_supported` 只提升代表排序、参与结构评价，不能单独保留基因；它真正的价值是反向使用——多外显子模型的位点未通过校验（`weak_splice_sites`）时值得人工查看。
+
+## 可选 Iso-seq 增强
 提供 `--isoseq` 后，完整长读链独立参与结构和代表裁决。
 
 `--utr-consensus` 会对 CDS 兼容的长读进行局部链聚类。主导链达到分子数和主导度阈值后，可调整 UTR 外显子和末端；只有共识外显子完整覆盖 CDS 时才应用，CDS 不变。
@@ -232,6 +258,7 @@ RefAnno 对每个二代 BAM 顺序扫描一遍，在同一趟里提取 junction 
 - Python 3.8 或更高版本；
 - 读取 BAM 时需要 `pysam`；
 - 蛋白 FASTA 自动比对时需要 `miniprot`；
+- 可选：剪接位点序列校验需要自行编译的 `minisplice`（conda 无此包），用 `--minisplice` 指定路径；
 - 其他输入处理使用 Python 标准库。
 
 ## 推荐比对参数
@@ -312,6 +339,10 @@ samtools index -c isoseq.bam
 --bam RNA.bam               二代 BAM，可重复
 --proteins PROTEINS.faa     同源蛋白 FASTA
 --isoseq ISO.bam            可选 Iso-seq BAM 或 BED12，可重复
+--minisplice PATH           minisplice 可执行文件（源码编译，conda 无此包）
+--splice-model FILE.kan     预训练 minisplice 模型；缺省自动训练
+--splice-scores FILE.tsv    已有基因组剪接位点分数，跳过训练与预测
+--min-splice-score 2        供体/受体位点通过校验的最低分数
 --utr-consensus             可选 Iso-seq UTR 共识修正
 --threads 16                蛋白比对线程数
 --set-weight NAME=FLOAT     覆盖集合默认权重，仅用于后续代表排序
@@ -332,6 +363,7 @@ refanno/
 ├── cli.py             命令行与主流程
 ├── models.py          转录本、长读链和蛋白命中数据模型
 ├── evidence.py        GFF/BAM/BED12、蛋白与深度证据
+├── splice.py          minisplice 训练、预测、缓存与位点索引
 ├── adjudication.py    结构评估、保留和代表裁决
 ├── consensus.py       UTR 共识与可变剪切
 ├── output.py          GFF3、蛋白、报告和摘要输出
@@ -379,6 +411,7 @@ python -m unittest discover -v
 - `reason`：基因保留原因；
 - `selection`：主代表选择依据；
 - `cds_depth`、`cds_coverage`、`isoform_molecules`：转录证据；
+- `splice_sites_supported`、`splice_min_score`：minisplice 序列校验的内含子通过数与最弱位点分数；
 - `protein_target`、`protein_identity`、`protein_coverage`、`protein_query_coverage`：同源蛋白证据；
 - `family_support`、`family_donors`、`duplicate_type/cluster/size`：重复家族证据、donor 与标记；
 - `review`：内部终止子、家族间接保留或 UTR 共识不确定等复核标签。
@@ -396,6 +429,7 @@ python -m unittest discover -v
 | `short_read_partial` | 有部分二代 RNA 证据，但结构未全部支持 |
 | `homology_only` | 没有可达阈值的 RNA 结构支持，凭合格同源蛋白保留 |
 | `family_indirect` | 凭重复家族的间接证据保留，自身无直接证据 |
+| `sequence_only` | 无 RNA 与蛋白证据，但全部 CDS 内含子通过 minisplice 序列校验 |
 | `untested` | 没有 RNA 数据，无法评价转录结构 |
 | `annotation_only` | 有 RNA 数据但未获结构支持，也未进入其他通道 |
 

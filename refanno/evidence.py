@@ -263,14 +263,23 @@ def load_protein_lengths(path):
     return lengths
 
 
-def run_miniprot(genome, proteins, executable, threads, outdir):
+def run_miniprot(genome, proteins, executable, threads, outdir, spsc=None):
     os.makedirs(outdir, exist_ok=True)
     output = os.path.join(outdir, "miniprot.gff3")
     cache_path = os.path.join(outdir, "miniprot.cache.json")
+    version = executable_version(executable)
+    spsc_option = []
+    if spsc:
+        match = re.match(r"(\d+)\.(\d+)", version)
+        if match and (int(match.group(1)), int(match.group(2))) >= (0, 16):
+            spsc_option = ["--spsc", spsc]
+        else:
+            print(f"警告: miniprot {version} 低于 0.16，不支持 --spsc，minisplice 分数仅用于结构校验",
+                  file=sys.stderr, flush=True)
     fingerprint = {
         "genome_sha256": file_sha256(genome), "proteins_sha256": file_sha256(proteins),
-        "miniprot_version": executable_version(executable), "threads": threads,
-        "options": ["--gff", "--outn=1"],
+        "miniprot_version": version, "threads": threads,
+        "options": ["--gff", "--outn=1"] + spsc_option,
     }
     if os.path.isfile(output) and os.path.getsize(output) > 0 and os.path.isfile(cache_path):
         try:
@@ -279,7 +288,7 @@ def run_miniprot(genome, proteins, executable, threads, outdir):
                 return output
         except (OSError, ValueError):
             pass
-    command = [executable, "-t", str(threads), "--gff", "--outn=1", genome, proteins]
+    command = [executable, "-t", str(threads), "--gff", "--outn=1"] + spsc_option + [genome, proteins]
     print("miniprot: " + " ".join(command), flush=True)
     temporary = output + ".tmp"
     try:

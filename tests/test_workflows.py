@@ -15,7 +15,8 @@ from tests.synthetic import build_multiexon, build_single_exon
 REPORT_FIELDS = [
     "gene_id", "transcript_id", "role", "chrom", "start", "end", "strand", "source_model",
     "structure_status", "evidence_class", "structure_coverage", "junctions_supported", "junctions_total",
-    "canonical_junctions", "complete_cds", "cds_depth", "cds_coverage", "cds_multi_depth",
+    "canonical_junctions", "splice_sites_supported", "splice_min_score", "complete_cds",
+    "cds_depth", "cds_coverage", "cds_multi_depth",
     "cds_multi_coverage", "family_support", "family_donors", "isoform_molecules", "protein_target",
     "protein_identity", "protein_coverage", "protein_query_coverage", "duplicate_type",
     "duplicate_cluster", "duplicate_size", "support", "reason", "selection", "review",
@@ -51,8 +52,8 @@ class WorkflowTests(unittest.TestCase):
             rows = list(reader)
         with (outdir / "summary.json").open() as handle:
             summary = json.load(handle)
-        self.assertEqual(summary["refanno_version"], "1.1.0")
-        self.assertEqual(summary["output_schema_version"], "1.1")
+        self.assertEqual(summary["refanno_version"], "1.2.0")
+        self.assertEqual(summary["output_schema_version"], "1.2")
         return rows, summary
 
     def read_tsv(self, path):
@@ -62,8 +63,8 @@ class WorkflowTests(unittest.TestCase):
     def assert_manifest(self, outdir):
         manifest = json.loads((outdir / "run_manifest.json").read_text())
         self.assertEqual(manifest["status"], "completed")
-        self.assertEqual(manifest["refanno_version"], "1.1.0")
-        self.assertEqual(manifest["output_schema_version"], "1.1")
+        self.assertEqual(manifest["refanno_version"], "1.2.0")
+        self.assertEqual(manifest["output_schema_version"], "1.2")
         self.assertTrue(manifest["inputs"])
         self.assertTrue(all(len(record["sha256"]) == 64 for record in manifest["inputs"]))
         for record in manifest["inputs"]:
@@ -284,9 +285,40 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(flat_stats[0]["spliced_reads"], 0)
         self.assertIn("可能不是 RNA-seq", stderr.getvalue())
 
+    def test_splice_scores_validation(self):
+        build_multiexon(self.root)
+        outdir = self.root / "out"
+        with (self.root / "scores.tsv").open("w") as out:
+            out.write("chr1\t1150\t+\tD\t9\nchr1\t3000\t+\tA\t11\nchr1\t2000\t+\tA\t0\n")
+        self.run_command([
+            sys.executable, str(self.script),
+            "--set", f"setA={self.root / 'setA.gff3'}", "--set", f"setB={self.root / 'setB.gff3'}",
+            "--genome", str(self.root / "genome.fa"),
+            "--trusted-set", "setA", "--trusted-set", "setB",
+            "--splice-scores", str(self.root / "scores.tsv"),
+            "--threads", "2", "--outdir", str(outdir),
+        ])
+        rows, summary = self.load_result(outdir)
+        self.assertEqual(summary["genes"], 1)
+        self.assertEqual(summary["structure_sequence_supported_genes"], 1)
+        winner = rows[0]
+        self.assertEqual(winner["source_model"], "setB|txsetB")
+        self.assertEqual(winner["structure_status"], "sequence_supported")
+        self.assertEqual(winner["evidence_class"], "sequence_only")
+        self.assertEqual(winner["splice_sites_supported"], "1")
+        self.assertEqual(winner["splice_min_score"], "9.0")
+        self.assertEqual(winner["reason"], "trusted_unique")
+        events = self.read_tsv(outdir / "decision_events.tsv")
+        weak = next(row for row in events if row["source_model"] == "setA|txsetA")
+        self.assertEqual(weak["outcome"], "dropped")
+        self.assertIn("2.6 剪接位点序列校验", (outdir / "qc_report.html").read_text())
+        confidence = [line.split("\t") for line in (outdir / "gene_confidence.bed").read_text().splitlines()
+                      if not line.startswith("track")]
+        self.assertEqual(confidence[0][3], f"{winner['gene_id']}|sequence_only")
+
     def test_version(self):
         result = self.run_command([sys.executable, str(self.script), "--version"])
-        self.assertEqual(result.stdout.strip(), "RefAnno 1.1.0")
+        self.assertEqual(result.stdout.strip(), "RefAnno 1.2.0")
 
 
 if __name__ == "__main__":

@@ -48,7 +48,8 @@ def cluster_loci(models):
     return list(groups.values())
 
 
-def evaluate_models(models, sj, iso, proteins, depth, genome, weights, min_sj, min_iso, min_coverage, min_protein_identity):
+def evaluate_models(models, sj, iso, proteins, depth, genome, weights, min_sj, min_iso, min_coverage,
+                    min_protein_identity, splice=None, min_splice_score=2.0):
     protein_cache = {}
     has_rna = bool(depth.bams or len(iso))
     for model in models:
@@ -66,6 +67,16 @@ def evaluate_models(models, sj, iso, proteins, depth, genome, weights, min_sj, m
             model.structure_coverage = model.junctions_supported / model.junctions_total
         else:
             model.structure_coverage = 1.0 if model.iso_support >= min_iso else model.coverage
+        if splice is not None and model.cds_introns:
+            site_scores = []
+            for intron in model.cds_introns:
+                donor, acceptor = splice.intron_scores(model, intron)
+                if donor is not None and acceptor is not None:
+                    site_scores.append(min(donor, acceptor))
+                    if donor >= min_splice_score and acceptor >= min_splice_score:
+                        model.splice_supported += 1
+            if site_scores:
+                model.splice_min_score = min(site_scores)
         model.rna_supported = bool(
             model.iso_support >= min_iso
             or (model.cds_introns and model.junctions_supported)
@@ -89,7 +100,10 @@ def evaluate_models(models, sj, iso, proteins, depth, genome, weights, min_sj, m
         if model.iso_support >= min_iso:
             model.structure_status = "exact_isoseq"
         elif not has_rna:
-            model.structure_status = "untested"
+            if splice is not None and model.cds_introns and model.splice_supported == model.junctions_total:
+                model.structure_status = "sequence_supported"
+            else:
+                model.structure_status = "untested"
         elif model.cds_introns and model.junctions_supported == model.junctions_total:
             model.structure_status = "supported"
         elif not model.cds_introns and model.coverage >= 0.5 and model.depth >= 10:
@@ -98,6 +112,10 @@ def evaluate_models(models, sj, iso, proteins, depth, genome, weights, min_sj, m
             model.structure_status = "partial"
         else:
             model.structure_status = "unsupported"
+        if (splice is not None and model.cds_introns
+                and model.splice_supported < model.junctions_total
+                and model.structure_status in {"partial", "unsupported", "untested"}):
+            model.review.append("weak_splice_sites")
 
 
 def model_has_expression(model, sj, iso, args):
@@ -138,7 +156,7 @@ def descending_rank(metrics, tie):
 
 
 def model_rank(model):
-    structure_rank = {"exact_isoseq": 3, "supported": 2, "partial": 1}.get(model.structure_status, 0)
+    structure_rank = {"exact_isoseq": 4, "supported": 3, "sequence_supported": 2, "partial": 1}.get(model.structure_status, 0)
     metrics = (structure_rank, model.complete_cds, model.structure_coverage, model.iso_support,
                model.depth, model.coverage, model.protein_coverage, model.protein_query_coverage,
                model.protein_identity, model.source_weight)
@@ -167,8 +185,9 @@ def representative_basis(item, args):
 def representative_rank(item, args):
     model, _, _, sources = item
     evidence_rank, _ = representative_basis(item, args)
+    splice_fraction = model.splice_supported / model.junctions_total if model.cds_introns else 0.0
     protein_metrics = (model.protein_coverage, model.protein_query_coverage, model.protein_identity) if evidence_rank == 3 else (0, 0, 0)
-    metrics = (evidence_rank, model.complete_cds, model.structure_coverage, model.iso_support,
+    metrics = (evidence_rank, model.complete_cds, model.structure_coverage, splice_fraction, model.iso_support,
                model.depth, model.coverage) + protein_metrics + (len(sources), model.source_weight)
     return descending_rank(metrics, model.key)
 
@@ -182,6 +201,8 @@ def evidence_class(model, reason, args):
         return "homology_only"
     if reason == "tandem_family_support":
         return "family_indirect"
+    if model.structure_status == "sequence_supported":
+        return "sequence_only"
     if model.structure_status == "untested":
         return "untested"
     return "annotation_only"

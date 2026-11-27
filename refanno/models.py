@@ -94,6 +94,8 @@ class Model:
     family_cluster: str = ""
     family_donors: list = field(default_factory=list)
     iso_support: int = 0
+    splice_supported: int = 0
+    splice_min_score: object = None
     protein_coverage: float = 0.0
     protein_identity: float = 0.0
     protein_query_coverage: float = 0.0

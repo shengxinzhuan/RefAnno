@@ -21,6 +21,7 @@ from .evidence import (
     run_miniprot,
 )
 from .output import write_outputs
+from .splice import SpliceIndex, pick_training_models, run_minisplice
 
 
 def named_paths(specs):
@@ -50,6 +51,10 @@ def parse_args(argv=None):
     parser.add_argument("--min-protein-coverage", type=float, default=0.5, help="单条蛋白命中对模型 CDS 的最低覆盖")
     parser.add_argument("--min-protein-query-coverage", type=float, default=0.5, help="命中对查询蛋白的最低覆盖")
     parser.add_argument("--isoseq", action="append", default=[], help="可选：Iso-seq BAM 或 BED12 读链，可多次")
+    parser.add_argument("--minisplice", help="minisplice 可执行文件路径（conda 无此包，需从源码编译）")
+    parser.add_argument("--splice-model", help="预训练 minisplice 模型 .kan；缺省时用输入注释自动训练")
+    parser.add_argument("--splice-scores", help="已有 minisplice 基因组分数 .tsv(.gz)，跳过训练与预测")
+    parser.add_argument("--min-splice-score", type=float, default=2.0, help="剪接供体/受体位点通过校验的最低分数")
     parser.add_argument("--outdir", required=True)
     parser.add_argument("--id-prefix", default="REFA")
     parser.add_argument("--max-isoforms", type=int, default=3, help="每基因总转录本上限，含主代表")
@@ -80,6 +85,10 @@ def parse_args(argv=None):
         parser.error("分子数、junction 支持阈值和线程数必须至少为 1")
     if args.tandem_max_gap < 0 or args.tandem_cds_ratio < 1 or args.tandem_min_members < 2 or args.tandem_min_multi_depth < 0:
         parser.error("串联间距和多重深度不能为负，CDS 长度比至少为 1，簇成员数至少为 2")
+    if args.splice_scores and (args.minisplice or args.splice_model):
+        parser.error("--splice-scores 不能与 --minisplice/--splice-model 同时使用")
+    if args.splice_model and not args.minisplice:
+        parser.error("--splice-model 需要同时提供 --minisplice 可执行文件路径")
     return args
 
 
@@ -94,6 +103,19 @@ def run(argv=None):
         models.extend(loaded)
     if not models:
         raise RuntimeError("没有读到含 CDS 的转录本")
+    trusted = {"egapx", "eviann", "e"} | {x.lower() for x in args.trusted_set}
+    loci = cluster_loci(models)
+    splice_scores = args.splice_scores
+    if args.minisplice and not splice_scores:
+        train_models, train_source = pick_training_models(models, loci, trusted)
+        print(f"minisplice: training on {len(train_models)} transcripts ({train_source})", flush=True)
+        splice_scores = run_minisplice(args.minisplice, args.genome, args.threads, args.outdir,
+                                       train_models, models, model_path=args.splice_model)
+    splice_index = None
+    if splice_scores:
+        splice_index = SpliceIndex()
+        loaded = splice_index.load(splice_scores, models)
+        print(f"splice sites: {loaded} model junction sites scored", flush=True)
     sj = SJIndex()
     for path in args.sj:
         sj.load(path)
@@ -109,7 +131,8 @@ def run(argv=None):
     protein_lengths = load_protein_lengths(args.proteins) if args.proteins else {}
     miniprot_gff = args.miniprot_gff
     if args.proteins and not miniprot_gff:
-        miniprot_gff = run_miniprot(args.genome, args.proteins, args.miniprot, args.threads, args.outdir)
+        miniprot_gff = run_miniprot(args.genome, args.proteins, args.miniprot, args.threads, args.outdir,
+                                    spsc=splice_scores)
     protein_evidence = ProteinIndex(miniprot_gff or "", protein_lengths)
     hits = [hit for values in protein_evidence.by_chrom.values() for hit in values]
     identical = sum(1 for hit in hits if hit.identity >= 0.999)
@@ -122,9 +145,8 @@ def run(argv=None):
     for name, value in named_paths(args.set_weight):
         weights[name.lower()] = float(value)
     evaluate_models(models, sj, iso, protein_evidence, depth, genome, weights, args.min_sj,
-                    args.min_isoform_molecules, args.min_cds_coverage, args.min_protein_identity)
-    loci = cluster_loci(models)
-    trusted = {"egapx", "eviann", "e"} | {x.lower() for x in args.trusted_set}
+                    args.min_isoform_molecules, args.min_cds_coverage, args.min_protein_identity,
+                    splice=splice_index, min_splice_score=args.min_splice_score)
     tandem_info = prepare_tandem_evidence(loci, sj, protein_evidence, genome, args)
     winners, dropped, relations = choose_representatives(loci, sj, iso, protein_evidence, args, trusted, tandem_info)
     print(f"selected {len(winners)} primary genes from {len(loci)} loci", flush=True)

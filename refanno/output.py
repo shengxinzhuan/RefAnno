@@ -171,8 +171,8 @@ def _table(headers, rows, limit=None, note=""):
 
 
 EVIDENCE_ORDER = ["isoseq_exact", "short_read_complete", "short_read_partial",
-                  "homology_only", "family_indirect", "annotation_only"]
-STATUS_ORDER = ["exact_isoseq", "supported", "partial", "unsupported", "untested"]
+                  "homology_only", "family_indirect", "sequence_only", "untested", "annotation_only"]
+STATUS_ORDER = ["exact_isoseq", "supported", "sequence_supported", "partial", "unsupported", "untested"]
 
 
 def _winner_junction_stats(winners, records, sj, iso, genome, args):
@@ -268,7 +268,7 @@ def write_review_qc(outdir, winners, models, records, relations, genome, args,
             writer.writerow({
                 "set_name": set_name, "input_transcripts": len(members),
                 "complete_cds": sum(model.complete_cds for model in members),
-                "structure_supported": sum(model.structure_status in {"exact_isoseq", "supported"} for model in members),
+                "structure_supported": sum(model.structure_status in {"exact_isoseq", "supported", "sequence_supported"} for model in members),
                 "structure_partial": sum(model.structure_status == "partial" for model in members),
                 "primary": fates[(set_name, "primary")], "alternative": fates[(set_name, "alternative")],
                 "dropped": fates[(set_name, "dropped")],
@@ -302,6 +302,8 @@ def write_review_qc(outdir, winners, models, records, relations, genome, args,
         overview_rows.append(("Iso-seq chains", f"{len(iso):,}"))
     if protein_evidence is not None and len(protein_evidence):
         overview_rows.append(("Protein hits", f"{len(protein_evidence):,}"))
+    if getattr(args, "splice_scores", None) or getattr(args, "minisplice", None):
+        overview_rows.append(("Splice validation", "minisplice"))
     overview = "".join(
         f"<tr><th>{_h(k)}</th><td class='num'>{v:,}</td></tr>" if isinstance(v, int)
         else f"<tr><th>{_h(k)}</th><td>{_h(v)}</td></tr>" for k, v in overview_rows)
@@ -328,6 +330,30 @@ def write_review_qc(outdir, winners, models, records, relations, genome, args,
         '<p class="dim">单外显子比例高的证据等级（尤其 homology_only）通常意味着假阳性风险。</p>'
         + _table(["Evidence class", "Genes", "Single-exon", "Single-exon %"], cross_rows))
 
+    splice_active = bool(getattr(args, "splice_scores", None) or getattr(args, "minisplice", None))
+    if splice_active:
+        multi = [m for m in primary_models if m.junctions_total]
+        full = sum(m.splice_supported == m.junctions_total for m in multi)
+        partial = sum(0 < m.splice_supported < m.junctions_total for m in multi)
+        none = sum(m.splice_supported == 0 for m in multi)
+        scored = [m.splice_min_score for m in multi if m.splice_min_score is not None]
+        score_edges = [("<0", -1e9, 0), ("0–2", 0, 2), ("2–6", 2, 6), ("6–10", 6, 10), ("≥10", 10, 1e9)]
+        score_bins = Counter(_bin(v, score_edges) for v in scored)
+        splice_rows = [
+            ("Multi-exon primary genes", len(multi)),
+            (f"All junctions pass (donor & acceptor ≥ {args.min_splice_score:g})", full),
+            ("Partially pass", partial),
+            ("No junction passes", none),
+            ("Flagged weak_splice_sites", sum("weak_splice_sites" in m.review for m in primary_models)),
+        ]
+        sections.append(
+            "<h3>2.6 剪接位点序列校验（minisplice）</h3><table>"
+            + "".join(f"<tr><th>{_h(k)}</th><td class='num'>{v:,}</td></tr>" for k, v in splice_rows)
+            + "</table><h4>最弱位点分数分布</h4>"
+            + _dist_table(score_bins, order=[e[0] for e in score_edges], label="Min site score")
+            + '<p class="dim">序列校验是注释自洽性检查：ab initio 预测器本就会产生规范剪接位点，'
+              '因此通过校验不代表独立证据，未通过则值得人工查看。</p>')
+
     fate_rows = []
     for set_name in sorted(set_counts):
         members = [model for model in models if model.set_name == set_name]
@@ -335,7 +361,7 @@ def write_review_qc(outdir, winners, models, records, relations, genome, args,
         fate_rows.append(
             f"<tr><th>{_h(set_name)}</th><td class='num'>{len(members):,}</td>"
             f"<td class='num'>{sum(m.complete_cds for m in members):,}</td>"
-            f"<td class='num'>{sum(m.structure_status in {'exact_isoseq', 'supported'} for m in members):,}</td>"
+            f"<td class='num'>{sum(m.structure_status in {'exact_isoseq', 'supported', 'sequence_supported'} for m in members):,}</td>"
             f"<td class='num'>{sum(m.structure_status == 'partial' for m in members):,}</td>"
             f"<td class='num'>{fates[(set_name, 'primary')]:,}</td>"
             f"<td class='num'>{fates[(set_name, 'alternative')]:,}</td>"
@@ -504,7 +530,7 @@ def write_review_qc(outdir, winners, models, records, relations, genome, args,
         score = risk_score(model, records[model.key]["reason"], winner["evidence_class"])
         if score:
             risk_rows.append((score, model, winner))
-    risk_rows.sort(key=lambda item: (-item[0], natural_key(item[1].chrom), item[1].cds[0][0]))
+    risk_rows.sort(key=lambda item: (-item[0], natural_key(item[1].chrom), item[1].cds[0][0], item[1].key))
     risk_table = []
     for score, model, winner in risk_rows[:50]:
         risk_table.append((
@@ -559,6 +585,8 @@ CONFIDENCE_BASE = {
     "short_read_partial": 550,
     "homology_only": 400,
     "family_indirect": 300,
+    "sequence_only": 250,
+    "untested": 250,
     "annotation_only": 200,
 }
 CONFIDENCE_TIERS = [
@@ -634,8 +662,9 @@ def write_curation_tracks(outdir, winners, records):
             else:
                 issue = winner["evidence_class"]
             risk = risk_score(model, record["reason"], winner["evidence_class"])
-            sites.append((-risk, natural_key(model.chrom), model.exons[0][0], model, record, score, rgb, issue))
-        for _, _, _, model, record, score, rgb, issue in sorted(sites):
+            sites.append((model, record, score, rgb, issue, risk))
+        sites.sort(key=lambda item: (-item[5], natural_key(item[0].chrom), item[0].exons[0][0], item[0].key))
+        for model, record, score, rgb, issue, _ in sites:
             curation.write(_bed_row(model, f"{record['gene_id']}|{issue}", score, rgb) + "\n")
 
 
@@ -655,7 +684,8 @@ def write_outputs(winners, dropped, relations, models, sj, iso, genome, args,
         gff.write("##gff-version 3\n")
         fields = ["gene_id", "transcript_id", "role", "chrom", "start", "end", "strand", "source_model",
                   "structure_status", "evidence_class", "structure_coverage", "junctions_supported", "junctions_total",
-                  "canonical_junctions", "complete_cds", "cds_depth", "cds_coverage", "cds_multi_depth",
+                  "canonical_junctions", "splice_sites_supported", "splice_min_score", "complete_cds",
+                  "cds_depth", "cds_coverage", "cds_multi_depth",
                   "cds_multi_coverage", "family_support", "family_donors", "isoform_molecules", "protein_target",
                   "protein_identity", "protein_coverage", "protein_query_coverage", "duplicate_type",
                   "duplicate_cluster", "duplicate_size", "support", "reason", "selection", "review"]
@@ -678,6 +708,7 @@ def write_outputs(winners, dropped, relations, models, sj, iso, genome, args,
                           ("junctions_supported", model.junctions_supported),
                           ("junctions_total", model.junctions_total),
                           ("canonical_junctions", model.canonical_junctions),
+                          ("splice_sites_supported", model.splice_supported),
                           ("complete_cds", int(model.complete_cds)), ("cds_depth", f"{model.depth:.2f}"),
                           ("cds_coverage", f"{model.coverage:.3f}"),
                           ("cds_multi_depth", f"{model.multi_depth:.2f}"),
@@ -711,6 +742,8 @@ def write_outputs(winners, dropped, relations, models, sj, iso, genome, args,
                              "junctions_supported": model.junctions_supported,
                              "junctions_total": model.junctions_total,
                              "canonical_junctions": model.canonical_junctions,
+                             "splice_sites_supported": model.splice_supported,
+                             "splice_min_score": "" if model.splice_min_score is None else f"{model.splice_min_score:.1f}",
                              "complete_cds": int(model.complete_cds),
                              "cds_depth": f"{model.depth:.3f}", "cds_coverage": f"{model.coverage:.3f}",
                              "cds_multi_depth": f"{model.multi_depth:.3f}",
@@ -747,6 +780,8 @@ def write_outputs(winners, dropped, relations, models, sj, iso, genome, args,
                                  "junctions_supported": alternative.junctions_supported,
                                  "junctions_total": alternative.junctions_total,
                                  "canonical_junctions": alternative.canonical_junctions,
+                                 "splice_sites_supported": alternative.splice_supported,
+                                 "splice_min_score": "" if alternative.splice_min_score is None else f"{alternative.splice_min_score:.1f}",
                                  "complete_cds": int(alternative.complete_cds),
                                  "cds_depth": f"{alternative.depth:.3f}", "cds_coverage": f"{alternative.coverage:.3f}",
                                  "cds_multi_depth": f"{alternative.multi_depth:.3f}",
@@ -802,7 +837,8 @@ def write_outputs(winners, dropped, relations, models, sj, iso, genome, args,
         "utr_consensus_changed": sum(bool(w.get("utr_changed")) for w in winners),
         "protein_supported_transcripts": sum(m.protein_coverage > 0 for m in models),
         "protein_only_retained_genes": sum(w["reason"] == "unique_with_protein" for w in winners),
-        "structure_supported_genes": sum(w["model"].structure_status in {"exact_isoseq", "supported"} for w in winners),
+        "structure_supported_genes": sum(w["model"].structure_status in {"exact_isoseq", "supported", "sequence_supported"} for w in winners),
+        "structure_sequence_supported_genes": sum(w["model"].structure_status == "sequence_supported" for w in winners),
         "structure_partial_genes": sum(w["model"].structure_status == "partial" for w in winners),
         "structure_untested_genes": sum(w["model"].structure_status == "untested" for w in winners),
         "review_genes": qc["review_genes"], "structural_changes": qc["structural_changes"],
