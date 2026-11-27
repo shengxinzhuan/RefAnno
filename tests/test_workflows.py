@@ -332,6 +332,23 @@ class WorkflowTests(unittest.TestCase):
                       if not line.startswith("track")]
         self.assertEqual(confidence[0][3], f"{winner['gene_id']}|sequence_only")
 
+    def test_splice_flags_rna_supported_models(self):
+        build_multiexon(self.root)
+        outdir = self.root / "out"
+        with (self.root / "scores.tsv").open("w") as out:
+            out.write("chr1\t1150\t+\tD\t0\nchr1\t2000\t+\tA\t0\nchr1\t3000\t+\tA\t0\n")
+        self.run_command(self.command(self.root, outdir) + [
+            "--isoseq", str(self.root / "iso.bed12"),
+            "--splice-scores", str(self.root / "scores.tsv"),
+        ])
+        rows, summary = self.load_result(outdir)
+        primary = next(row for row in rows if row["role"] == "primary")
+        self.assertEqual(primary["source_model"], "setA|txsetA")
+        self.assertEqual(primary["structure_status"], "exact_isoseq")
+        self.assertEqual(primary["junctions_supported"], "1")
+        self.assertEqual(primary["splice_sites_supported"], "0")
+        self.assertIn("weak_splice_sites", primary["review"])
+
     def test_version(self):
         result = self.run_command([sys.executable, str(self.script), "--version"])
         self.assertEqual(result.stdout.strip(), "RefAnno 1.2.0")

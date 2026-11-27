@@ -595,7 +595,7 @@ def write_review_qc(outdir, winners, models, records, relations, genome, args,
         "<h2>9. 复查优先级</h2><h3>9.1 Review 标记计数</h3>" + flag_html
         + "<h3>9.2 高风险基因（Top 50）</h3>"
         + '<p class="dim">风险分：internal_stop +4；仅蛋白+单外显子+零深度 +3；family_indirect +2；'
-          '存在不支持 junction +2；UTR 歧义/不完整 +1；结构 partial/untested +1。全量见 decision_report.tsv 的 review 列。</p>'
+          '存在不支持 junction +2；UTR 歧义/不完整 +1；weak_splice_sites +1；结构 partial/untested +1。全量见 decision_report.tsv 的 review 列。</p>'
         + _table(["Score", "Gene", "Source model", "Evidence class", "Reason", "Flags", "Exons",
                   "Depth", "Coverage", "Junctions", "Protein id", "Protein cov"], risk_table, limit=50))
 
@@ -659,6 +659,8 @@ def risk_score(model, reason, evidence_class):
     if model.junctions_total and model.junctions_supported < model.junctions_total:
         score += 2
     if any(flag.startswith("utr_") for flag in model.review):
+        score += 1
+    if "weak_splice_sites" in model.review:
         score += 1
     if model.structure_status in {"partial", "unsupported", "untested"}:
         score += 1

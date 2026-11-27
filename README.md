@@ -220,12 +220,13 @@ RefAnno 对每个二代 BAM 顺序扫描一遍，在同一趟里提取 junction 
 
 **`--bam` 只应提供 RNA-seq 比对。** Hi-C、ATAC、基因组重测序等数据的覆盖度不是表达信号，却会被当作 CDS 深度参与裁决，使单外显子模型被误判为有 RNA 支持。RefAnno 在扫描时统计每个 BAM 的比对数和含剪接 reads 数并写入 `run_manifest.json`；若一个 BAM 的剪接 reads 比例低于 1%，会在运行时给出警告。
 
-## 无转录组模式：minisplice 剪接位点序列校验
+## minisplice 剪接位点序列校验（有无转录组均可用）
 
-有些类群没有转录组数据，只能提供 GFF + 近缘蛋白。此时不带 `--bam` 运行即可（所有模型记为 `untested`），并建议接入 [minisplice](https://github.com/lh3/minisplice) 做剪接位点序列校验，它有两方面作用：
+有些类群没有转录组数据，只能提供 GFF + 近缘蛋白；有转录组时序列校验同样有参考价值。接入 [minisplice](https://github.com/lh3/minisplice) 后它有三方面作用：
 
-1. **校验模型结构**：minisplice 用 1D-CNN 估计基因组中每个 GT/AG 位点是真实剪接位点的几率比分。RefAnno 检查每个 CDS 内含子的供体和受体分数，全部达到 `--min-splice-score`（默认 2）的多外显子模型记为 `sequence_supported`；未全部通过且缺乏直接证据的模型加 `weak_splice_sites` 复查标记。
+1. **校验模型结构**：minisplice 用 1D-CNN 估计基因组中每个 GT/AG 位点是真实剪接位点的几率比分。RefAnno 检查每个 CDS 内含子的供体和受体分数：无 RNA 数据时，全部达到 `--min-splice-score`（默认 2）的多外显子模型记为 `sequence_supported`；任何模式下，存在未通过位点的多外显子模型都会加 `weak_splice_sites` 复查标记并计入风险分——**有 reads 支持但位点序列分很低的 junction 可能是多重比对造成的假象**，这正是有转录组时序列校验的主要价值。注意 minisplice 只评估 GT-AG（及 GC-AG）型位点，少数 AT-AC 型次要剪接体内含子没有分数，会被一并标记，人工复查时 motif 列可以区分。
 2. **改善远缘蛋白比对**：miniprot ≥0.16 时自动把分数文件通过 `--spsc` 传入，提高远缘同源比对的剪接位点准确性，从而改善无转录组模式下最关键的蛋白证据质量。
+3. **参与代表排序**：同座位冲突模型的排序中，位点通过率作为结构指标的一项参与比较。
 
 minisplice 不在 conda 仓库，需要从源码编译后用 `--minisplice` 指定路径：
 

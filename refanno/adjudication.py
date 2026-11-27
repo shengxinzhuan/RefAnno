@@ -112,9 +112,7 @@ def evaluate_models(models, sj, iso, proteins, depth, genome, weights, min_sj, m
             model.structure_status = "partial"
         else:
             model.structure_status = "unsupported"
-        if (splice is not None and model.cds_introns
-                and model.splice_supported < model.junctions_total
-                and model.structure_status in {"partial", "unsupported", "untested"}):
+        if splice is not None and model.cds_introns and model.splice_supported < model.junctions_total:
             model.review.append("weak_splice_sites")
 
 
