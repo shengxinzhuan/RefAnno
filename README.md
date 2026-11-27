@@ -385,8 +385,10 @@ python -m unittest discover -v
 
 | 文件 | 内容 |
 |---|---|
-| `final.gff3` | 最终基因、mRNA、exon、CDS 和 UTR，可载入 IGV |
-| `final.proteins.faa` | 按最终 CDS 翻译的全部转录本蛋白 |
+| `final.gff3` | 高置信最终基因：有直接证据（Iso-seq/二代/同源蛋白/序列校验）或多集合一致共识；含 mRNA、exon、CDS 和 UTR，可载入 IGV |
+| `final.proteins.faa` | 高置信层全部转录本按最终 CDS 翻译的蛋白 |
+| `weak.gff3` | 弱支持基因：`family_indirect`、`annotation_only`、`untested` 且非共识；属性与 final 相同但明确隔离，不建议直接进入下游分析 |
+| `weak.proteins.faa` | 弱支持层转录本的蛋白 |
 | `decision_report.tsv` | 结构状态、证据等级、保留原因、代表依据及各类证据指标 |
 | `decision_events.tsv` | 每个输入模型的去向：主代表、替代转录本或淘汰，以及原因和相关模型 |
 | `junction_evidence.tsv` | 逐 junction 的 unique/multi reads、Iso-seq 分子、motif 和支持状态 |
@@ -414,7 +416,10 @@ python -m unittest discover -v
 - `splice_sites_supported`、`splice_min_score`：minisplice 序列校验的内含子通过数与最弱位点分数；
 - `protein_target`、`protein_identity`、`protein_coverage`、`protein_query_coverage`：同源蛋白证据；
 - `family_support`、`family_donors`、`duplicate_type/cluster/size`：重复家族证据、donor 与标记；
-- `review`：内部终止子、家族间接保留或 UTR 共识不确定等复核标签。
+- `review`：内部终止子、家族间接保留或 UTR 共识不确定等复核标签；
+- `output_tier`：`final`（高置信）或 `weak`（弱支持）。
+
+**final/weak 分层**：`final.gff3` 只放高置信基因——证据等级为 `isoseq_exact`、`short_read_complete`、`short_read_partial`、`homology_only`、`sequence_only`，或保留原因是多集合一致链共识（`2set/3set_chain_consensus`）。其余基因（`family_indirect`、`annotation_only`、`untested` 且非共识）写入 `weak.gff3`。这样在没有转录组数据的物种上，下游不会把"凭可信来源或家族间接证据留下来的基因"和"有独立证据筛选过的基因"混成一个合集使用。两层的基因 ID 连续编号，`decision_report.tsv` 的 `output_tier` 列记录每个基因的去向。
 
 `summary.json` 中的 `review_genes` 和 `structural_changes` 分别给出需要复查的基因数和实际发生 UTR 修订的基因数，`evidence_classes` 按等级统计最终基因。
 

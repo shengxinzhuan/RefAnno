@@ -290,6 +290,8 @@ def write_review_qc(outdir, winners, models, records, relations, genome, args,
         ("Input sets", "; ".join(f"{name} ({count:,} transcripts)" for name, count in sorted(set_counts.items()))),
         ("Input transcripts", len(models)),
         ("Primary genes", total_genes),
+        ("Final (supported) genes", sum(output_tier(w) == "final" for w in winners)),
+        ("Weak (low-support) genes", sum(output_tier(w) == "weak" for w in winners)),
         ("Transcripts", sum(1 + len(winner["alternatives"]) for winner in winners)),
         ("Structural changes (UTR consensus)", len(changes)),
         ("Genes requiring review", len(review_winners)),
@@ -668,6 +670,15 @@ def write_curation_tracks(outdir, winners, records):
             curation.write(_bed_row(model, f"{record['gene_id']}|{issue}", score, rgb) + "\n")
 
 
+def output_tier(winner):
+    if winner["evidence_class"] in {"isoseq_exact", "short_read_complete", "short_read_partial",
+                                    "homology_only", "sequence_only"}:
+        return "final"
+    if winner["reason"].endswith("set_chain_consensus"):
+        return "final"
+    return "weak"
+
+
 def write_outputs(winners, dropped, relations, models, sj, iso, genome, args,
                   bam_stats=None, protein_evidence=None):
     winners.sort(key=lambda w: (natural_key(w["model"].chrom), w["model"].cds[0][0],
@@ -680,15 +691,18 @@ def write_outputs(winners, dropped, relations, models, sj, iso, genome, args,
     os.makedirs(args.outdir, exist_ok=True)
     with open(os.path.join(args.outdir, "final.gff3"), "w") as gff, \
             open(os.path.join(args.outdir, "final.proteins.faa"), "w") as proteins, \
+            open(os.path.join(args.outdir, "weak.gff3"), "w") as weak_gff, \
+            open(os.path.join(args.outdir, "weak.proteins.faa"), "w") as weak_proteins, \
             open(os.path.join(args.outdir, "decision_report.tsv"), "w", newline="") as report:
         gff.write("##gff-version 3\n")
+        weak_gff.write("##gff-version 3\n")
         fields = ["gene_id", "transcript_id", "role", "chrom", "start", "end", "strand", "source_model",
                   "structure_status", "evidence_class", "structure_coverage", "junctions_supported", "junctions_total",
                   "canonical_junctions", "splice_sites_supported", "splice_min_score", "complete_cds",
                   "cds_depth", "cds_coverage", "cds_multi_depth",
                   "cds_multi_coverage", "family_support", "family_donors", "isoform_molecules", "protein_target",
                   "protein_identity", "protein_coverage", "protein_query_coverage", "duplicate_type",
-                  "duplicate_cluster", "duplicate_size", "support", "reason", "selection", "review"]
+                  "duplicate_cluster", "duplicate_size", "support", "reason", "selection", "review", "output_tier"]
         writer = csv.DictWriter(report, fieldnames=fields, delimiter="\t", extrasaction="ignore")
         writer.writeheader()
         for index, winner in enumerate(winners, 1):
@@ -699,6 +713,8 @@ def write_outputs(winners, dropped, relations, models, sj, iso, genome, args,
             alternatives = winner["alternatives"]
             if alternatives:
                 iso_loci += 1
+            tier = output_tier(winner)
+            out_gff, out_proteins = (gff, proteins) if tier == "final" else (weak_gff, weak_proteins)
             gene_attrs = [("ID", gene_id), ("gene_biotype", "protein_coding"),
                           ("support", "+".join(sorted(winner["sources"]))),
                           ("source_model", model.source_model), ("reason", winner["reason"]),
@@ -725,8 +741,8 @@ def write_outputs(winners, dropped, relations, models, sj, iso, genome, args,
                                    ("duplicate_size", duplicate["size"])])
             if model.review:
                 gene_attrs.append(("flag_review", ",".join(sorted(set(model.review)))))
-            gff.write(model_row(model, "gene", model.exons[0][0], model.exons[-1][1], gene_attrs) + "\n")
-            write_transcript(gff, proteins, model, gene_id, 1, genome, "primary", model.iso_support)
+            out_gff.write(model_row(model, "gene", model.exons[0][0], model.exons[-1][1], gene_attrs) + "\n")
+            write_transcript(out_gff, out_proteins, model, gene_id, 1, genome, "primary", model.iso_support)
             transcript_count += 1
             records[model.key] = {
                 "gene_id": gene_id, "transcript_id": f"{gene_id}-T1", "outcome": "primary",
@@ -759,11 +775,11 @@ def write_outputs(winners, dropped, relations, models, sj, iso, genome, args,
                              "duplicate_size": duplicate["size"] if duplicate else "",
                              "support": "+".join(sorted(winner["sources"])),
                              "reason": winner["reason"], "selection": winner["selection"],
-                             "review": ",".join(sorted(set(model.review)))})
+                             "review": ",".join(sorted(set(model.review))), "output_tier": tier})
             for rank, (alternative, support) in enumerate(alternatives, 2):
                 retained.add(alternative.key)
                 alternative.output_id = gene_id
-                write_transcript(gff, proteins, alternative, gene_id, rank, genome, "alternative", support)
+                write_transcript(out_gff, out_proteins, alternative, gene_id, rank, genome, "alternative", support)
                 transcript_count += 1
                 records[alternative.key] = {
                     "gene_id": gene_id, "transcript_id": f"{gene_id}-T{rank}", "outcome": "alternative",
@@ -797,7 +813,7 @@ def write_outputs(winners, dropped, relations, models, sj, iso, genome, args,
                                  "duplicate_size": duplicate["size"] if duplicate else "",
                                  "support": alternative.set_name,
                                  "reason": "isoseq_exact_chain", "selection": "isoseq_chain_abundance",
-                                 "review": ""})
+                                 "review": "", "output_tier": tier})
 
     with open(os.path.join(args.outdir, "dropped.gff3"), "w") as out:
         out.write("##gff-version 3\n")
@@ -831,6 +847,8 @@ def write_outputs(winners, dropped, relations, models, sj, iso, genome, args,
     summary = {
         "refanno_version": __version__, "output_schema_version": OUTPUT_SCHEMA_VERSION,
         "input_transcripts": len(models), "genes": len(winners), "transcripts": transcript_count,
+        "final_genes": sum(output_tier(w) == "final" for w in winners),
+        "weak_genes": sum(output_tier(w) == "weak" for w in winners),
         "genes_with_alternatives": iso_loci, "alternative_transcripts": transcript_count - len(winners),
         "dropped_transcripts": len(models) - len(retained),
         "utr_consensus_applied": sum(bool(w["model"].utr_note) for w in winners),

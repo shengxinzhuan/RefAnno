@@ -19,7 +19,7 @@ REPORT_FIELDS = [
     "cds_depth", "cds_coverage", "cds_multi_depth",
     "cds_multi_coverage", "family_support", "family_donors", "isoform_molecules", "protein_target",
     "protein_identity", "protein_coverage", "protein_query_coverage", "duplicate_type",
-    "duplicate_cluster", "duplicate_size", "support", "reason", "selection", "review",
+    "duplicate_cluster", "duplicate_size", "support", "reason", "selection", "review", "output_tier",
 ]
 
 
@@ -147,6 +147,22 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("short.t1", {fields[3] for fields in sites})
         fates = self.read_tsv(outdir / "input_fates.tsv")
         self.assertEqual({row["set_name"]: row["primary"] for row in fates}, {"setA": "3", "setB": "1"})
+        by_source = {row["source_model"]: row for row in rows}
+        tiers = {name: row["output_tier"] for name, row in by_source.items()}
+        self.assertEqual(tiers["setA|dup1.t1"], "weak")
+        self.assertEqual(tiers["setA|short.t1"], "final")
+        self.assertEqual(tiers["setA|protein.t1"], "final")
+        self.assertEqual(tiers["setB|dup2.t1"], "final")
+        self.assertEqual(summary["final_genes"], 3)
+        self.assertEqual(summary["weak_genes"], 1)
+        weak_id = by_source["setA|dup1.t1"]["gene_id"]
+        final_gff = (outdir / "final.gff3").read_text()
+        weak_gff = (outdir / "weak.gff3").read_text()
+        self.assertIn(f"ID={weak_id};", weak_gff)
+        self.assertNotIn(f"ID={weak_id};", final_gff)
+        self.assertIn(by_source["setA|short.t1"]["gene_id"], final_gff)
+        self.assertIn(f">{weak_id}-T1", (outdir / "weak.proteins.faa").read_text())
+        self.assertNotIn(f">{weak_id}-T1", (outdir / "final.proteins.faa").read_text())
 
     def test_unrelated_adjacent_models_do_not_share_family_evidence(self):
         build_single_exon(self.root, related_duplicates=False)
