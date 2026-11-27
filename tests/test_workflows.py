@@ -327,7 +327,7 @@ class WorkflowTests(unittest.TestCase):
         events = self.read_tsv(outdir / "decision_events.tsv")
         weak = next(row for row in events if row["source_model"] == "setA|txsetA")
         self.assertEqual(weak["outcome"], "dropped")
-        self.assertIn("2.6 剪接位点序列校验", (outdir / "qc_report.html").read_text())
+        self.assertIn("2.7 剪接位点序列校验", (outdir / "qc_report.html").read_text())
         confidence = [line.split("\t") for line in (outdir / "gene_confidence.bed").read_text().splitlines()
                       if not line.startswith("track")]
         self.assertEqual(confidence[0][3], f"{winner['gene_id']}|sequence_only")

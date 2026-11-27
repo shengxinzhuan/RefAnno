@@ -440,7 +440,7 @@ python -m unittest discover -v
 
 推荐的 IGV 复查方式是同时载入 `final.gff3`、`review.gff3` 和 `supporting_junctions.bed`：`final.gff3` 查看保留结果，`review.gff3` 高亮需要复核的模型，`supporting_junctions.bed` 直接对照 BAM 中的剪接位点。发现可疑基因后，再到 `decision_report.tsv` 查看该基因的证据指标和 `review` 标签，在 `decision_events.tsv` 追溯同座位被淘汰的模型，在 `junction_evidence.tsv` 查看逐 junction 的 reads 支持。`family_indirect` 的基因可沿 `family_rescues.tsv` 找到提供证据的 donor 模型。
 
-`qc_report.html` 不依赖外部资源，可直接用浏览器打开。报告分九节：运行概览；证据链（证据等级、保留原因、主代表依据、结构状态分布，以及证据等级 × 单外显子交叉表）；输入集合命运与保留率；最终基因集的外显子数/CDS 长度分布；RNA 证据（逐 BAM 统计并对剪接率异常的 BAM 给出警告、主代表 junction 支持与弱支持 junction 列表、CDS 深度与覆盖度分箱）；Iso-seq 证据（含 UTR 修订的长度变化分布）；蛋白同源证据（一致性分布，并在命中高度一致时提示自我确认风险）；重复与基因家族（含家族救援明细）；复查优先级（review 标记计数与按风险分排序的 Top 50 基因）。基因数量和 BUSCO 不能单独证明结构正确，QC 报告因此以证据等级分布、复查清单和结构变更为主线，而不是只给一个通过比例。
+`qc_report.html` 不依赖外部资源，可直接用浏览器打开。报告分九节：运行概览；证据链（证据等级、保留原因、主代表依据、结构状态分布，证据等级 × 单外显子交叉表，final/weak 分层 × 证据等级，可选的 minisplice 序列校验小节）；输入集合命运（保留率、final/weak 贡献、淘汰原因分布、集合间一致链矩阵）；最终基因集的外显子数/CDS 长度/转录本数分布；RNA 证据（逐 BAM 统计并对剪接率异常的 BAM 给出警告、主代表 junction 支持与弱支持 junction 列表、CDS 深度与覆盖度分箱及二维交叉）；Iso-seq 证据（含 UTR 修订的长度变化分布）；蛋白同源证据（一致性分布，并在命中高度一致时提示自我确认风险）；重复与基因家族（含家族救援明细）；复查优先级（review 标记计数与按风险分排序的 Top 50 基因）。基因数量和 BUSCO 不能单独证明结构正确，QC 报告因此以证据等级分布、复查清单和结构变更为主线，而不是只给一个通过比例。
 
 ## 对接 GSAman 人工矫正
 

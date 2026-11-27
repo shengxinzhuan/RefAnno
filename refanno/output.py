@@ -5,7 +5,7 @@ import os
 from collections import Counter
 
 from . import OUTPUT_SCHEMA_VERSION, __version__
-from .adjudication import detect_duplicate_clusters
+from .adjudication import chain_groups, cluster_loci, detect_duplicate_clusters
 from .models import attr_text, natural_key, overlap, translate
 
 
@@ -280,6 +280,9 @@ def write_review_qc(outdir, winners, models, records, relations, genome, args,
     status_counts = Counter(winner["model"].structure_status for winner in winners)
     reason_counts = Counter(winner["reason"] for winner in winners)
     selection_counts = Counter(winner["selection"] for winner in winners)
+    tier_counts = Counter(output_tier(winner) for winner in winners)
+    dropped_reasons = Counter(records[model.key]["reason"] for model in models
+                              if records[model.key]["outcome"] == "dropped")
 
     sections = []
 
@@ -290,8 +293,8 @@ def write_review_qc(outdir, winners, models, records, relations, genome, args,
         ("Input sets", "; ".join(f"{name} ({count:,} transcripts)" for name, count in sorted(set_counts.items()))),
         ("Input transcripts", len(models)),
         ("Primary genes", total_genes),
-        ("Final (supported) genes", sum(output_tier(w) == "final" for w in winners)),
-        ("Weak (low-support) genes", sum(output_tier(w) == "weak" for w in winners)),
+        ("Final (supported) genes", tier_counts.get("final", 0)),
+        ("Weak (low-support) genes", tier_counts.get("weak", 0)),
         ("Transcripts", sum(1 + len(winner["alternatives"]) for winner in winners)),
         ("Structural changes (UTR consensus)", len(changes)),
         ("Genes requiring review", len(review_winners)),
@@ -332,6 +335,17 @@ def write_review_qc(outdir, winners, models, records, relations, genome, args,
         '<p class="dim">单外显子比例高的证据等级（尤其 homology_only）通常意味着假阳性风险。</p>'
         + _table(["Evidence class", "Genes", "Single-exon", "Single-exon %"], cross_rows))
 
+    tier_evidence = Counter((output_tier(winner), winner["evidence_class"]) for winner in winners)
+    tier_rows = []
+    for key in [k for k in EVIDENCE_ORDER if evidence_counts.get(k)] + sorted(set(evidence_counts) - set(EVIDENCE_ORDER)):
+        final_n, weak_n = tier_evidence.get(("final", key), 0), tier_evidence.get(("weak", key), 0)
+        tier_rows.append((f"<b>{_h(key)}</b>", f"{final_n:,}", f"{weak_n:,}"))
+    sections.append(
+        "<h3>2.6 final/weak 分层 × 证据等级</h3>"
+        '<p class="dim">final 层：直接证据或多集合共识；weak 层：family_indirect、annotation_only、'
+        'untested 且非共识，写入 weak.gff3。</p>'
+        + _table(["Evidence class", "Final tier", "Weak tier"], tier_rows))
+
     splice_active = bool(getattr(args, "splice_scores", None) or getattr(args, "minisplice", None))
     if splice_active:
         multi = [m for m in primary_models if m.junctions_total]
@@ -349,7 +363,7 @@ def write_review_qc(outdir, winners, models, records, relations, genome, args,
             ("Flagged weak_splice_sites", sum("weak_splice_sites" in m.review for m in primary_models)),
         ]
         sections.append(
-            "<h3>2.6 剪接位点序列校验（minisplice）</h3><table>"
+            "<h3>2.7 剪接位点序列校验（minisplice）</h3><table>"
             + "".join(f"<tr><th>{_h(k)}</th><td class='num'>{v:,}</td></tr>" for k, v in splice_rows)
             + "</table><h4>最弱位点分数分布</h4>"
             + _dist_table(score_bins, order=[e[0] for e in score_edges], label="Min site score")
@@ -360,25 +374,51 @@ def write_review_qc(outdir, winners, models, records, relations, genome, args,
     for set_name in sorted(set_counts):
         members = [model for model in models if model.set_name == set_name]
         kept = fates[(set_name, "primary")] + fates[(set_name, "alternative")]
+        tier_final = sum(1 for winner in winners
+                         if winner["model"].set_name == set_name and output_tier(winner) == "final")
+        tier_weak = fates[(set_name, "primary")] - tier_final
         fate_rows.append(
             f"<tr><th>{_h(set_name)}</th><td class='num'>{len(members):,}</td>"
             f"<td class='num'>{sum(m.complete_cds for m in members):,}</td>"
             f"<td class='num'>{sum(m.structure_status in {'exact_isoseq', 'supported', 'sequence_supported'} for m in members):,}</td>"
             f"<td class='num'>{sum(m.structure_status == 'partial' for m in members):,}</td>"
             f"<td class='num'>{fates[(set_name, 'primary')]:,}</td>"
+            f"<td class='num'>{tier_final:,}</td>"
+            f"<td class='num'>{tier_weak:,}</td>"
             f"<td class='num'>{fates[(set_name, 'alternative')]:,}</td>"
             f"<td class='num'>{fates[(set_name, 'dropped')]:,}</td>"
             + _bar(kept, len(members), "#59a14f") + "</tr>")
+    pair_counts = Counter()
+    set_chains = Counter()
+    for locus in cluster_loci(models):
+        for group in chain_groups(locus):
+            group_sets = sorted({model.set_name for model in group})
+            for set_name in group_sets:
+                set_chains[set_name] += 1
+            for i, first in enumerate(group_sets):
+                for second in group_sets[i + 1:]:
+                    pair_counts[(first, second)] += 1
+    pair_rows = []
+    for (first, second), count in pair_counts.most_common(20):
+        base = min(set_chains[first], set_chains[second]) or 1
+        pair_rows.append((f"<b>{_h(first)}</b>", f"<b>{_h(second)}</b>", f"{count:,}",
+                          f"{100.0 * count / base:.1f}%"))
     sections.append(
         "<h2>3. 输入集合命运</h2><table><tr><th>Set</th><th>Transcripts</th><th>Complete CDS</th>"
-        "<th>Structure supported</th><th>Partial</th><th>Primary</th><th>Alternative</th><th>Dropped</th>"
-        "<th>Retention</th><th></th></tr>" + "".join(fate_rows) + "</table>")
+        "<th>Structure supported</th><th>Partial</th><th>Primary</th><th>Final tier</th><th>Weak tier</th>"
+        "<th>Alternative</th><th>Dropped</th><th>Retention</th><th></th></tr>" + "".join(fate_rows) + "</table>"
+        "<h3>3.1 淘汰原因分布</h3>" + _dist_table(dropped_reasons, label="Drop reason")
+        + "<h3>3.2 集合间一致链</h3>"
+        + '<p class="dim">同一座位内 CDS 剪接链完全一致（单外显子按 CDS 重叠 ≥90%）的集合对；'
+          '百分比以两集合中较少的链数为基数。这些一致链是 2set/3set_chain_consensus 和 minisplice 自训练训练集的来源。</p>'
+        + _table(["Set A", "Set B", "Shared chains", "Share"], pair_rows))
 
     exon_edges = [("1", 1, 2), ("2", 2, 3), ("3–5", 3, 6), ("6–10", 6, 11), ("11–20", 11, 21), (">20", 21, 1 << 62)]
     cds_edges = [("<300", 0, 300), ("300–600", 300, 600), ("600–1200", 600, 1200),
                  ("1200–2400", 1200, 2400), ("2400–6000", 2400, 6000), (">6000", 6000, 1 << 62)]
     exon_bins = Counter(_bin(len(m.exons), exon_edges) for m in primary_models)
     cds_bins = Counter(_bin(m.cds_len, cds_edges) for m in primary_models)
+    isoform_bins = Counter(str(1 + len(winner["alternatives"])) for winner in winners)
     consensus3 = reason_counts.get("3set_chain_consensus", 0)
     consensus2 = reason_counts.get("2set_chain_consensus", 0)
     struct_rows = [
@@ -394,7 +434,8 @@ def write_review_qc(outdir, winners, models, records, relations, genome, args,
     sections.append(
         "<h2>4. 最终基因集结构</h2><table>" + struct_overview + "</table>"
         "<h3>4.1 外显子数分布</h3>" + _dist_table(exon_bins, order=[e[0] for e in exon_edges], label="Exons") +
-        "<h3>4.2 CDS 长度分布 (bp)</h3>" + _dist_table(cds_bins, order=[e[0] for e in cds_edges], label="CDS length"))
+        "<h3>4.2 CDS 长度分布 (bp)</h3>" + _dist_table(cds_bins, order=[e[0] for e in cds_edges], label="CDS length") +
+        "<h3>4.3 每基因转录本数分布</h3>" + _dist_table(isoform_bins, order=["1", "2", "3"], label="Isoforms"))
 
     rna_sections = []
     if bam_stats:
@@ -432,11 +473,19 @@ def write_review_qc(outdir, winners, models, records, relations, genome, args,
         cov_edges = [("≥0.9", 0.9, 2.0), ("0.5–0.9", 0.5, 0.9), ("<0.5", -1e-9, 0.5)]
         depth_bins = Counter(_bin(m.depth, depth_edges) for m in primary_models)
         cov_bins = Counter(_bin(m.coverage, cov_edges) for m in primary_models)
+        dc = Counter((_bin(m.depth, depth_edges), _bin(m.coverage, cov_edges)) for m in primary_models)
+        dc_rows = []
+        for dlabel, _, _ in depth_edges:
+            row = [f"<b>{_h(dlabel)}</b>"] + [f"{dc.get((dlabel, clabel), 0):,}" for clabel, _, _ in cov_edges]
+            dc_rows.append(tuple(row))
         rna_sections.append(
             "<h3>5.4 主代表 CDS 深度与覆盖度</h3><div class='cols'><div><h4>Depth</h4>"
             + _dist_table(depth_bins, order=[e[0] for e in depth_edges], label="Depth")
             + "</div><div><h4>Coverage</h4>"
-            + _dist_table(cov_bins, order=[e[0] for e in cov_edges], label="Coverage") + "</div></div>")
+            + _dist_table(cov_bins, order=[e[0] for e in cov_edges], label="Coverage") + "</div></div>"
+            + "<h3>5.5 深度 × 覆盖度</h3>"
+            + '<p class="dim">高覆盖但零深度的基因通常是比对多重性或注释冗余造成的假象，值得留意。</p>'
+            + _table(["Depth \\ Coverage"] + [e[0] for e in cov_edges], dc_rows))
     if rna_sections:
         sections.append("<h2>5. RNA 证据</h2>" + "".join(rna_sections))
 
