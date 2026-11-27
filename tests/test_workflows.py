@@ -131,6 +131,19 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("source_model=setA|protein.t1", review)
         self.assertNotIn("source_model=setA|short.t1", review)
         self.assertIn("RefAnno QC report", (outdir / "qc_report.html").read_text())
+        confidence = [line.split("\t") for line in (outdir / "gene_confidence.bed").read_text().splitlines()
+                      if not line.startswith("track")]
+        self.assertEqual(len(confidence), 4)
+        for fields in confidence:
+            self.assertEqual(len(fields), 9)
+            self.assertTrue(0 <= int(fields[4]) <= 1000)
+            self.assertRegex(fields[8], r"^\d+,\d+,\d+$")
+            self.assertEqual(int(fields[1]), int(fields[6]))
+        sites = [line.split("\t") for line in (outdir / "curation_sites.bed").read_text().splitlines()
+                 if not line.startswith("track")]
+        site_names = {fields[3].split("|")[1] for fields in sites}
+        self.assertEqual(site_names, {"tandem_family_support", "homology_only"})
+        self.assertNotIn("short.t1", {fields[3] for fields in sites})
         fates = self.read_tsv(outdir / "input_fates.tsv")
         self.assertEqual({row["set_name"]: row["primary"] for row in fates}, {"setA": "3", "setB": "1"})
 

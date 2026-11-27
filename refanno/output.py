@@ -501,22 +501,9 @@ def write_review_qc(outdir, winners, models, records, relations, genome, args,
     risk_rows = []
     for winner in winners:
         model = winner["model"]
-        score = 0
-        if "internal_stop" in model.review:
-            score += 4
-        if records[model.key]["reason"] == "unique_with_protein" and len(model.cds) == 1 and model.depth == 0:
-            score += 3
-        if winner["evidence_class"] == "family_indirect":
-            score += 2
-        if model.junctions_total and model.junctions_supported < model.junctions_total:
-            score += 2
-        if any(flag.startswith("utr_") for flag in model.review):
-            score += 1
-        if model.structure_status in {"partial", "unsupported", "untested"}:
-            score += 1
-        if not score:
-            continue
-        risk_rows.append((score, model, winner))
+        score = risk_score(model, records[model.key]["reason"], winner["evidence_class"])
+        if score:
+            risk_rows.append((score, model, winner))
     risk_rows.sort(key=lambda item: (-item[0], natural_key(item[1].chrom), item[1].cds[0][0]))
     risk_table = []
     for score, model, winner in risk_rows[:50]:
@@ -564,6 +551,92 @@ family_rescues.tsv · input_fates.tsv · run_manifest.json</p>
     with open(os.path.join(outdir, "qc_report.html"), "w") as out:
         out.write(document)
     return {"review_genes": len(review_winners), "structural_changes": len(changes)}
+
+
+CONFIDENCE_BASE = {
+    "isoseq_exact": 900,
+    "short_read_complete": 800,
+    "short_read_partial": 550,
+    "homology_only": 400,
+    "family_indirect": 300,
+    "annotation_only": 200,
+}
+CONFIDENCE_TIERS = [
+    (750, "26,152,80"),
+    (500, "230,171,2"),
+    (300, "244,109,67"),
+    (0, "150,150,150"),
+]
+
+
+def risk_score(model, reason, evidence_class):
+    score = 0
+    if "internal_stop" in model.review:
+        score += 4
+    if reason == "unique_with_protein" and len(model.cds) == 1 and model.depth == 0:
+        score += 3
+    if evidence_class == "family_indirect":
+        score += 2
+    if model.junctions_total and model.junctions_supported < model.junctions_total:
+        score += 2
+    if any(flag.startswith("utr_") for flag in model.review):
+        score += 1
+    if model.structure_status in {"partial", "unsupported", "untested"}:
+        score += 1
+    return score
+
+
+def confidence_score(model, evidence_class):
+    if "internal_stop" in model.review:
+        return 50
+    score = CONFIDENCE_BASE.get(evidence_class, 100)
+    score -= 30 * (model.junctions_total - model.junctions_supported)
+    score -= 50 * len(set(model.review))
+    return max(0, min(1000, score))
+
+
+def confidence_rgb(model, score):
+    if "internal_stop" in model.review:
+        return "215,48,39"
+    for threshold, rgb in CONFIDENCE_TIERS:
+        if score >= threshold:
+            return rgb
+    return CONFIDENCE_TIERS[-1][1]
+
+
+def _bed_row(model, name, score, rgb):
+    return "\t".join([
+        model.chrom, str(model.exons[0][0] - 1), str(model.exons[-1][1]), name, str(score),
+        model.strand, str(model.cds[0][0] - 1), str(model.cds[-1][1]), rgb,
+    ])
+
+
+def write_curation_tracks(outdir, winners, records):
+    with open(os.path.join(outdir, "gene_confidence.bed"), "w") as confidence, \
+            open(os.path.join(outdir, "curation_sites.bed"), "w") as curation:
+        confidence.write('track name="RefAnno gene confidence" itemRgb=On visibility=dense\n')
+        curation.write('track name="RefAnno curation sites" itemRgb=On\n')
+        sites = []
+        for winner in winners:
+            model = winner["model"]
+            record = records[model.key]
+            score = confidence_score(model, winner["evidence_class"])
+            rgb = confidence_rgb(model, score)
+            confidence.write(_bed_row(model, f"{record['gene_id']}|{winner['evidence_class']}", score, rgb) + "\n")
+            needs_review = (model.review or winner["reason"] == "tandem_family_support"
+                            or model.structure_status in {"partial", "unsupported", "untested"})
+            if not needs_review:
+                continue
+            if "internal_stop" in model.review:
+                issue = "internal_stop"
+            elif model.review:
+                issue = "+".join(sorted(set(model.review)))
+            else:
+                issue = winner["evidence_class"]
+            risk = risk_score(model, record["reason"], winner["evidence_class"])
+            sites.append((-risk, natural_key(model.chrom), model.exons[0][0], model, record, score, rgb, issue))
+        for _, _, _, model, record, score, rgb, issue in sorted(sites):
+            curation.write(_bed_row(model, f"{record['gene_id']}|{issue}", score, rgb) + "\n")
 
 
 def write_outputs(winners, dropped, relations, models, sj, iso, genome, args,
@@ -714,6 +787,7 @@ def write_outputs(winners, dropped, relations, models, sj, iso, genome, args,
             for i, (start, end) in enumerate(model.cds, 1):
                 out.write(model_row(model, "CDS", start, end, [("ID", f"{txid}.CDS.{i}"), ("Parent", txid)]) + "\n")
 
+    write_curation_tracks(args.outdir, winners, records)
     write_decision_evidence(args.outdir, models, records, relations, sj, iso, genome, args)
     qc = write_review_qc(args.outdir, winners, models, records, relations, genome, args,
                          sj=sj, iso=iso, bam_stats=bam_stats, protein_evidence=protein_evidence,
